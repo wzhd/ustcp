@@ -3,3 +3,6 @@
 members = [
     "ustunet",
 ]
+
+[profile.release]
+debug = true

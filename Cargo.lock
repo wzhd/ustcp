@@ -687,6 +687,11 @@ dependencies = [
 ]
 
 [[package]]
+name = "trilock"
+version = "0.1.0"
+source = "git+https://github.com/wzhd/trilock.git#dc5b657f8042061847f6f7c03354479ea95a545b"
+
+[[package]]
 name = "tun"
 version = "0.4.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -757,6 +762,7 @@ dependencies = [
  "snafu",
  "tokio",
  "tokio-fd",
+ "trilock",
  "tun",
 ]
 

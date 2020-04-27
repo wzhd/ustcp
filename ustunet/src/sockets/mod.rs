@@ -1,7 +1,6 @@
 //! Store TcpSockets and deliver packets by source and destination SocketAddr for processing.
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::Arc;
 
 pub use super::util::convert_to_socket_address;
 use smoltcp::socket::TcpSocket;
@@ -12,7 +11,6 @@ use log::{error, info};
 
 use super::mpsc::{self};
 
-use super::SocketLock as Mutex;
 use crate::dispatch::poll_queue::QueueUpdater;
 use crate::stream::internal::Connection;
 
@@ -114,8 +112,9 @@ impl SocketPool {
     }
 }
 
-#[allow(deprecated)]
-fn new_conn(local: SocketAddr) -> Result<Arc<SocketLock<TcpSocket<'static>>>, smoltcp::Error> {
+type LockTcp = SocketLock<TcpSocket<'static>>;
+
+fn new_conn(local: SocketAddr) -> Result<(LockTcp, LockTcp, LockTcp), smoltcp::Error> {
     let mut socket = create_tcp_socket();
     if !socket.is_open() {
         info!("opening tcp listener for {:?}", local);
@@ -124,7 +123,7 @@ fn new_conn(local: SocketAddr) -> Result<Arc<SocketLock<TcpSocket<'static>>>, sm
             e
         })?;
     }
-    let socket = Arc::new(Mutex::new(socket));
+    let socket = SocketLock::new(socket);
     Ok(socket)
 }
 

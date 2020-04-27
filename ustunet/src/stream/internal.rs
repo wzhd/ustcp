@@ -1,6 +1,6 @@
 use crate::dispatch::poll_queue::QueueUpdater;
 use crate::dispatch::{packet_to_bytes, SocketHandle};
-use crate::stream::{ReadinessState, SocketPointer, WriteReadiness};
+use crate::stream::{ReadinessState, TcpLock, WriteReadiness};
 use smoltcp::iface::Packet;
 use smoltcp::phy::DeviceCapabilities;
 use smoltcp::socket::PollAt;
@@ -14,7 +14,7 @@ use std::fmt::Formatter;
 /// Reference to TcpSocket.
 /// Notify readers and writers after IO activities.
 pub(crate) struct Connection {
-    pub socket: SocketPointer,
+    pub socket: TcpLock,
     /// Can be used as a key in key-value storage.
     handle: SocketHandle,
     /// Contains an optional Waker which would be set by the reader
@@ -33,7 +33,7 @@ impl fmt::Debug for Connection {
 
 impl Connection {
     pub(super) fn new(
-        socket: SocketPointer,
+        socket: TcpLock,
         addr: SocketHandle,
         read_readiness: ReadinessState,
         write_readiness: WriteReadiness,

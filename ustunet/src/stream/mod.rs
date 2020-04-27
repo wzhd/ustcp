@@ -1,15 +1,14 @@
 //! TcpStream and private structures.
 use super::SocketLock;
-use super::SocketLockGuard;
 use crate::dispatch::poll_queue::QueueUpdater;
 use crate::sockets::AddrPair;
 use crate::stream::internal::Connection;
+use crate::SocketLockGuard;
+use futures::ready;
 use futures::task::Poll;
-use futures::{ready, FutureExt};
 use smoltcp::socket::{TcpSocket, TcpState};
 use std::fmt;
 use std::fmt::Formatter;
-use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
@@ -24,10 +23,8 @@ pub(crate) type WriteReadiness = Arc<std_sync::Mutex<SharedState>>;
 
 pub(crate) mod internal;
 
-type SocketPointer = Arc<SocketLock<TcpSocket<'static>>>;
-type LockedSocket = SocketLockGuard<TcpSocket<'static>>;
-type LockOutput = (SocketPointer, LockedSocket);
-type LockFuture = Pin<Box<dyn Future<Output = LockOutput> + Send>>;
+type Tcp = TcpSocket<'static>;
+type TcpLock = SocketLock<Tcp>;
 
 pub struct TcpStream {
     pub writer: WriteHalf,
@@ -38,12 +35,12 @@ pub struct TcpStream {
 }
 
 pub struct ReadHalf {
-    socket_locking: LockFuture,
+    mutex: TcpLock,
     shared_state: ReadinessState,
 }
 
 pub struct WriteHalf {
-    socket_locking: LockFuture,
+    mutex: TcpLock,
     shared_state: ReadinessState,
 }
 
@@ -56,18 +53,18 @@ impl TcpStream {
     /// Returns a TcpStream and a struct containing references used
     /// internally to move data between buffers and network interfaces.
     pub(crate) fn new(
-        socket: SocketPointer,
+        tcp_locks: (TcpLock, TcpLock, TcpLock),
         poll_queue: QueueUpdater,
         addr: AddrPair,
     ) -> (TcpStream, Connection) {
-        let (reader, set_ready) = ReadHalf::new(socket.clone());
-        let (writer, write_readiness) = WriteHalf::new(socket.clone());
+        let (reader, set_ready) = ReadHalf::new(tcp_locks.0);
+        let (writer, write_readiness) = WriteHalf::new(tcp_locks.1);
         let tcp = TcpStream {
             reader,
             writer,
             addr: addr.clone(),
         };
-        let connection = Connection::new(socket, addr, set_ready, write_readiness, poll_queue);
+        let connection = Connection::new(tcp_locks.2, addr, set_ready, write_readiness, poll_queue);
         (tcp, connection)
     }
 
@@ -86,22 +83,17 @@ impl TcpStream {
     }
 }
 
-async fn lock_socket(socket: SocketPointer) -> LockOutput {
-    let locked = { socket.lock().await };
-    (socket, locked)
-}
-
 impl ReadHalf {
-    fn new(socket: SocketPointer) -> (Self, ReadinessState) {
+    fn new(socket: TcpLock) -> (Self, ReadinessState) {
         let state = SharedState { waker: None };
         let shared_state = Arc::new(std_sync::Mutex::new(state));
         let s = ReadHalf {
-            socket_locking: lock_socket(socket).boxed(),
+            mutex: socket,
             shared_state: shared_state.clone(),
         };
         (s, shared_state)
     }
-    fn read_impl(mut s: LockedSocket, buf: &mut [u8]) -> io::Result<Option<usize>> {
+    fn read_impl(mut s: SocketLockGuard<'_, Tcp>, buf: &mut [u8]) -> io::Result<Option<usize>> {
         if s.can_recv() {
             let n = s
                 .recv_slice(buf)
@@ -123,10 +115,10 @@ impl ReadHalf {
 }
 
 impl WriteHalf {
-    fn new(socket: SocketPointer) -> (Self, WriteReadiness) {
+    fn new(socket: TcpLock) -> (Self, WriteReadiness) {
         let shared_state = Arc::new(std_sync::Mutex::new(SharedState { waker: None }));
         let s = Self {
-            socket_locking: lock_socket(socket).boxed(),
+            mutex: socket,
             shared_state: shared_state.clone(),
         };
         (s, shared_state)
@@ -135,13 +127,17 @@ impl WriteHalf {
 
 impl AsyncRead for ReadHalf {
     fn poll_read(
-        mut self: Pin<&mut Self>,
+        self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &mut [u8],
     ) -> task::Poll<io::Result<usize>> {
-        let (pointer, socket) = ready!(self.socket_locking.as_mut().poll(cx));
-        self.socket_locking = lock_socket(pointer).boxed();
-        let read_result = Self::read_impl(socket, buf);
+        let Self {
+            ref mut mutex,
+            ref mut shared_state,
+        } = self.get_mut();
+        let l = mutex.poll_lock(cx);
+        let guard = ready!(l);
+        let read_result = Self::read_impl(guard, buf);
         trace!("read result: {:?}", read_result);
         let size = read_result?;
         trace!("read size: {:?}", size);
@@ -149,20 +145,23 @@ impl AsyncRead for ReadHalf {
             return task::Poll::Ready(Ok(n));
         }
         trace!("set waker");
-        self.shared_state.lock().unwrap().waker = Some(cx.waker().clone());
+        shared_state.lock().unwrap().waker = Some(cx.waker().clone());
         task::Poll::Pending
     }
 }
 
 impl AsyncWrite for WriteHalf {
     fn poll_write(
-        mut self: Pin<&mut Self>,
+        self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> task::Poll<io::Result<usize>> {
-        let (pointer, mut s): (SocketPointer, LockedSocket) =
-            ready!(self.socket_locking.as_mut().poll(cx));
-        self.socket_locking = lock_socket(pointer).boxed();
+        let Self {
+            ref mut mutex,
+            ref mut shared_state,
+        } = self.get_mut();
+        let p = mutex.poll_lock(cx);
+        let mut s = ready!(p);
         if s.can_send() {
             let s = s
                 .send_slice(buf)
@@ -170,8 +169,9 @@ impl AsyncWrite for WriteHalf {
             trace!("Written {} bytes.", s);
             return Poll::Ready(Ok(s));
         }
+
         trace!("Setting waker for writer.");
-        self.shared_state.lock().unwrap().waker = Some(cx.waker().clone());
+        shared_state.lock().unwrap().waker = Some(cx.waker().clone());
         Poll::Pending
     }
 

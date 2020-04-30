@@ -4,6 +4,8 @@ use std::io;
 use std::net::SocketAddr;
 use std::str::FromStr;
 use tokio::net::TcpStream;
+use tracing_subscriber;
+use tracing_subscriber::EnvFilter;
 use ustunet;
 use ustunet::TcpListener;
 
@@ -24,7 +26,9 @@ fn default_server_address() -> SocketAddr {
 
 #[tokio::main]
 async fn main() {
-    pretty_env_logger::init();
+    let _subscriber = tracing_subscriber::fmt()
+        .with_env_filter(EnvFilter::from_default_env())
+        .init();
     let up: ConnectUp = argh::from_env();
     let server = up.server;
     let mut listener = TcpListener::bind(&up.tun).unwrap();

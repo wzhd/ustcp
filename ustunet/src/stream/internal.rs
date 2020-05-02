@@ -1,6 +1,6 @@
 use crate::dispatch::poll_queue::QueueUpdater;
 use crate::dispatch::{packet_to_bytes, SocketHandle};
-use crate::stream::{ReadinessState, TcpLock, WriteReadiness};
+use crate::stream::{ReadinessState, Tcp, TcpLock, WriteReadiness};
 use smoltcp::iface::Packet;
 use smoltcp::phy::DeviceCapabilities;
 use smoltcp::socket::PollAt;
@@ -54,7 +54,9 @@ impl Connection {
         ip_repr: &IpRepr,
         tcp_repr: &TcpRepr<'_>,
     ) -> Result<Option<(IpRepr, TcpRepr<'static>)>, Error> {
+        use std::ops::Deref;
         let mut socket = self.socket.lock().await;
+        check_acceptability(socket.deref(), ip_repr, tcp_repr)?;
         let reply = socket.process(timestamp, &ip_repr, &tcp_repr);
         if socket.can_recv() {
             if let Some(waker) = self.read_readiness.lock().unwrap().waker.take() {
@@ -121,4 +123,73 @@ impl Connection {
             .expect("Poll Queue closed");
         Ok(())
     }
+}
+
+fn check_acceptability(tcp: &Tcp, ip_repr: &IpRepr, repr: &TcpRepr) -> Result<(), smoltcp::Error> {
+    use smoltcp::socket::TcpState as State;
+    use smoltcp::Error::Dropped;
+    use std::borrow::Borrow;
+    let error = Err(Dropped);
+
+    let tcp = tcp.borrow();
+    let state = tcp.state();
+    let local_endpoint = tcp.local_endpoint();
+    let remote_endpoint = tcp.remote_endpoint();
+    if state == State::Closed {
+        warn!(
+            "Socket closed, could not accept packet with source {:?}:{} and destination {:?}:{}.",
+            ip_repr.src_addr(),
+            repr.src_port,
+            ip_repr.dst_addr(),
+            repr.dst_port,
+        );
+        return Err(Dropped);
+    }
+
+    // If we're still listening for SYNs and the packet has an ACK, it cannot
+    // be destined to this socket, but another one may well listen on the same
+    // local endpoint.
+    if state == State::Listen && repr.ack_number.is_some() {
+        warn!(
+            "Socket listening for SYN could not accept ACK, from {:?} to {:?}",
+            remote_endpoint, local_endpoint
+        );
+        return Err(Dropped);
+    }
+
+    // Reject packets with a wrong destination.
+    if local_endpoint.port != repr.dst_port {
+        warn!(
+            "Destination {:?} does not match local_endpoint {:?}",
+            repr.dst_port, local_endpoint
+        );
+        return error;
+    }
+    if !local_endpoint.addr.is_unspecified() && local_endpoint.addr != ip_repr.dst_addr() {
+        warn!(
+            "Destination address {:?} does not match local endpoint {:?}",
+            ip_repr.dst_addr(),
+            local_endpoint.addr
+        );
+        return error;
+    }
+
+    // Reject packets from a source to which we aren't connected.
+    if remote_endpoint.port != 0 && remote_endpoint.port != repr.src_port {
+        warn!(
+            "Packet source port {} does not match remote endpoint {:?}",
+            repr.src_port, remote_endpoint
+        );
+        return error;
+    }
+    if !remote_endpoint.addr.is_unspecified() && remote_endpoint.addr != ip_repr.src_addr() {
+        warn!(
+            "Packet source address {:?} does not match remote address {:?}",
+            ip_repr.src_addr(),
+            remote_endpoint.addr
+        );
+        return error;
+    }
+
+    Ok(())
 }

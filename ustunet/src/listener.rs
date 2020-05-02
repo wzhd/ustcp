@@ -39,7 +39,9 @@ impl TcpListener {
         let (rd, wr) = split(fd);
         let (mut interface, connections) = Interface::new(capabilities);
         tokio::spawn(async move {
-            interface.poll(rd, wr).await.expect("processing interface");
+            if let Err(e) = interface.poll(rd, wr).await {
+                error!("{:?}", e);
+            }
         });
         let listener = TcpListener {
             receiver: connections,

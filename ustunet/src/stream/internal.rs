@@ -1,4 +1,4 @@
-use crate::dispatch::poll_queue::QueueUpdater;
+use crate::dispatch::poll_queue::DispatchQueue;
 use crate::dispatch::{packet_to_bytes, SocketHandle};
 use crate::stream::{ReadinessState, Tcp, TcpLock, WriteReadiness};
 use smoltcp::iface::Packet;
@@ -21,8 +21,6 @@ pub(crate) struct Connection {
     /// after exhausting the rx buffer.
     read_readiness: ReadinessState,
     write_readiness: WriteReadiness,
-    /// Send timing information to a queue to schedule the socket for future polling.
-    send_poll: QueueUpdater,
 }
 
 impl fmt::Debug for Connection {
@@ -37,14 +35,12 @@ impl Connection {
         addr: SocketHandle,
         read_readiness: ReadinessState,
         write_readiness: WriteReadiness,
-        send_poll: QueueUpdater,
     ) -> Connection {
         Connection {
             socket,
             handle: addr,
             read_readiness,
             write_readiness,
-            send_poll,
         }
     }
     /// Process incoming packet and queue for polling.
@@ -53,6 +49,7 @@ impl Connection {
         timestamp: Instant,
         ip_repr: &IpRepr,
         tcp_repr: &TcpRepr<'_>,
+        send_poll: &mut DispatchQueue,
     ) -> Result<Option<(IpRepr, TcpRepr<'static>)>, Error> {
         use std::ops::Deref;
         let mut socket = self.socket.lock().await;
@@ -63,10 +60,7 @@ impl Connection {
                 waker.wake();
             }
         }
-        self.send_poll
-            .send(self.handle.clone(), socket.poll_at())
-            .await
-            .expect("queue closed");
+        send_poll.send(self.handle.clone(), socket.poll_at());
         trace!("connection reply {:?}", reply);
         reply
     }
@@ -78,6 +72,7 @@ impl Connection {
         mut buf: &mut Vec<u8>,
         timestamp: Instant,
         capabilities: &DeviceCapabilities,
+        send_poll: &mut DispatchQueue,
     ) -> Result<(), smoltcp::Error> {
         assert_eq!(0, buf.len(), "Given buffer should be empty.");
         let mut tcp = self.socket.lock().await;
@@ -117,10 +112,7 @@ impl Connection {
                 trace!("tcp socket needs to be polled at {:?}", instant);
             }
         }
-        self.send_poll
-            .send(self.handle.clone(), poll_at)
-            .await
-            .expect("Poll Queue closed");
+        send_poll.send(self.handle.clone(), poll_at);
         Ok(())
     }
 }

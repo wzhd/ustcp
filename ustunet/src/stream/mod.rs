@@ -1,6 +1,5 @@
 //! TcpStream and private structures.
 use super::SocketLock;
-use crate::dispatch::poll_queue::QueueUpdater;
 use crate::sockets::AddrPair;
 use crate::stream::internal::Connection;
 use crate::SocketLockGuard;
@@ -54,7 +53,6 @@ impl TcpStream {
     /// internally to move data between buffers and network interfaces.
     pub(crate) fn new(
         tcp_locks: (TcpLock, TcpLock, TcpLock),
-        poll_queue: QueueUpdater,
         addr: AddrPair,
     ) -> (TcpStream, Connection) {
         let (reader, set_ready) = ReadHalf::new(tcp_locks.0);
@@ -64,7 +62,7 @@ impl TcpStream {
             writer,
             addr: addr.clone(),
         };
-        let connection = Connection::new(tcp_locks.2, addr, set_ready, write_readiness, poll_queue);
+        let connection = Connection::new(tcp_locks.2, addr, set_ready, write_readiness);
         (tcp, connection)
     }
 

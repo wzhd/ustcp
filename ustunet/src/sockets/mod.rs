@@ -11,7 +11,7 @@ use log::{error, info};
 
 use super::mpsc::{self};
 
-use crate::dispatch::poll_queue::QueueUpdater;
+use crate::dispatch::poll_queue::DispatchQueue;
 use crate::stream::internal::Connection;
 
 use crate::SocketLock;
@@ -26,8 +26,6 @@ pub(crate) struct SocketPool {
     sockets: HashMap<AddrPair, Connection>,
     /// Received tcp connections.
     new_conns: mpsc::Sender<TcpStream>,
-    /// Queue a socket to be polled for egress after a period.
-    send_poll: QueueUpdater,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
@@ -39,13 +37,12 @@ pub struct AddrPair {
 
 impl SocketPool {
     /// Create a socket set using the provided storage.
-    pub fn new(send_poll: QueueUpdater) -> (SocketPool, mpsc::Receiver<TcpStream>) {
+    pub fn new() -> (SocketPool, mpsc::Receiver<TcpStream>) {
         let sockets = HashMap::new();
         let (tx, rx) = mpsc::channel(1);
         let s = SocketPool {
             sockets,
             new_conns: tx,
-            send_poll,
         };
         (s, rx)
     }
@@ -56,6 +53,7 @@ impl SocketPool {
         ip_repr: IpRepr,
         tcp_repr: TcpRepr<'_>,
         timestamp: Instant,
+        send_poll: &mut DispatchQueue,
     ) -> Result<Option<(IpRepr, TcpRepr<'static>)>, smoltcp::Error> {
         let (src_addr, dst_addr) = (ip_repr.src_addr(), ip_repr.dst_addr());
         let src = convert_to_socket_address(src_addr, tcp_repr.src_port)?;
@@ -76,7 +74,9 @@ impl SocketPool {
             debug!("creating socket {:?}", pair);
             self.new_connection(pair).await?
         };
-        let reply = socket.process(timestamp, &ip_repr, &tcp_repr).await?;
+        let reply = socket
+            .process(timestamp, &ip_repr, &tcp_repr, send_poll)
+            .await?;
         Ok(reply)
     }
     pub(crate) async fn dispatch(
@@ -85,13 +85,16 @@ impl SocketPool {
         timestamp: Instant,
         addr: AddrPair,
         capabilities: &DeviceCapabilities,
+        send_poll: &mut DispatchQueue,
     ) -> Result<(), smoltcp::Error> {
         assert_eq!(0, buf.len(), "Given buffer should be empty.");
         let socket = self.sockets.get_mut(&addr).ok_or_else(|| {
             warn!("Address {:?} does not belong to a known socket.", addr);
             smoltcp::Error::Dropped
         })?;
-        socket.dispatch(buf, timestamp, capabilities).await
+        socket
+            .dispatch(buf, timestamp, capabilities, send_poll)
+            .await
     }
     /// Create a new connection in response to SYN.
     async fn new_connection(&mut self, pair: AddrPair) -> Result<&mut Connection, smoltcp::Error> {
@@ -103,7 +106,7 @@ impl SocketPool {
             return Err(smoltcp::Error::Dropped);
         }
         let socket = new_conn(pair.local)?;
-        let (tcp, connection) = TcpStream::new(socket, self.send_poll.clone(), pair.clone());
+        let (tcp, connection) = TcpStream::new(socket, pair.clone());
         self.new_conns.send(tcp).await.unwrap_or_else(|error| {
             error!("tcp source {:?}", error);
         });

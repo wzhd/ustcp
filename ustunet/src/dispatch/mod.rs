@@ -43,8 +43,8 @@ enum SelectValue {
 impl Interface {
     pub fn new(capabilities: DeviceCapabilities) -> (Interface, mpsc::Receiver<TcpStream>) {
         let clock = Clock::new();
-        let queue = DispatchQueue::new(clock);
-        let (pool, incoming) = SocketPool::new();
+        let (queue, queue_sender) = DispatchQueue::new(clock);
+        let (pool, incoming) = SocketPool::new(queue_sender);
         let interface = Interface {
             sockets: pool,
             capabilities,

@@ -10,7 +10,6 @@ use snafu::Snafu;
 
 pub use listener::TcpListener;
 pub(crate) use tokio::sync::mpsc;
-pub(crate) use trilock::Guard as SocketLockGuard;
 pub(crate) use trilock::TriLock as SocketLock;
 
 #[derive(Debug, Snafu)]

@@ -11,10 +11,9 @@ use log::{error, info};
 
 use super::mpsc::{self};
 
-use crate::dispatch::poll_queue::DispatchQueue;
+use crate::dispatch::poll_queue::{DispatchQueue, QueueUpdater};
 use crate::stream::internal::Connection;
 
-use crate::SocketLock;
 use smoltcp::phy::DeviceCapabilities;
 use smoltcp::time::Instant;
 use smoltcp::wire::{IpRepr, TcpControl, TcpRepr};
@@ -26,6 +25,8 @@ pub(crate) struct SocketPool {
     sockets: HashMap<AddrPair, Connection>,
     /// Received tcp connections.
     new_conns: mpsc::Sender<TcpStream>,
+    /// Queue a socket to be polled for egress after a period.
+    send_poll: QueueUpdater,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
@@ -37,12 +38,13 @@ pub struct AddrPair {
 
 impl SocketPool {
     /// Create a socket set using the provided storage.
-    pub fn new() -> (SocketPool, mpsc::Receiver<TcpStream>) {
+    pub fn new(send_poll: QueueUpdater) -> (SocketPool, mpsc::Receiver<TcpStream>) {
         let sockets = HashMap::new();
         let (tx, rx) = mpsc::channel(1);
         let s = SocketPool {
             sockets,
             new_conns: tx,
+            send_poll,
         };
         (s, rx)
     }
@@ -105,8 +107,8 @@ impl SocketPool {
             );
             return Err(smoltcp::Error::Dropped);
         }
-        let socket = new_conn(pair.local)?;
-        let (tcp, connection) = TcpStream::new(socket, pair.clone());
+        let socket = open_socket(pair.local)?;
+        let (tcp, connection) = TcpStream::new(socket, self.send_poll.clone(), pair.clone());
         self.new_conns.send(tcp).await.unwrap_or_else(|error| {
             error!("tcp source {:?}", error);
         });
@@ -115,9 +117,7 @@ impl SocketPool {
     }
 }
 
-type LockTcp = SocketLock<TcpSocket<'static>>;
-
-fn new_conn(local: SocketAddr) -> Result<(LockTcp, LockTcp, LockTcp), smoltcp::Error> {
+fn open_socket(local: SocketAddr) -> Result<TcpSocket<'static>, smoltcp::Error> {
     let mut socket = create_tcp_socket();
     if !socket.is_open() {
         info!("opening tcp listener for {:?}", local);
@@ -126,7 +126,6 @@ fn new_conn(local: SocketAddr) -> Result<(LockTcp, LockTcp, LockTcp), smoltcp::E
             e
         })?;
     }
-    let socket = SocketLock::new(socket);
     Ok(socket)
 }
 

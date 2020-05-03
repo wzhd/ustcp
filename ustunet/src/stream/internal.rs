@@ -14,12 +14,14 @@ use std::fmt::Formatter;
 /// Reference to TcpSocket.
 /// Notify readers and writers after IO activities.
 pub(crate) struct Connection {
-    pub socket: TcpLock,
+    pub(crate) socket: TcpLock,
     /// Can be used as a key in key-value storage.
     handle: SocketHandle,
     /// Contains an optional Waker which would be set by the reader
     /// after exhausting the rx buffer.
     read_readiness: ReadinessState,
+    /// Use to wake the writer when a full tx buffer has newly freed up space
+    /// and can be written to again.
     write_readiness: WriteReadiness,
 }
 
@@ -51,9 +53,10 @@ impl Connection {
         tcp_repr: &TcpRepr<'_>,
         send_poll: &mut DispatchQueue,
     ) -> Result<Option<(IpRepr, TcpRepr<'static>)>, Error> {
-        use std::ops::Deref;
+        use std::ops::DerefMut;
         let mut socket = self.socket.lock().await;
-        check_acceptability(socket.deref(), ip_repr, tcp_repr)?;
+        let socket = &mut socket.deref_mut().tcp;
+        check_acceptability(socket, ip_repr, tcp_repr)?;
         let reply = socket.process(timestamp, &ip_repr, &tcp_repr);
         if socket.can_recv() {
             if let Some(waker) = self.read_readiness.lock().unwrap().waker.take() {
@@ -75,7 +78,8 @@ impl Connection {
         send_poll: &mut DispatchQueue,
     ) -> Result<(), smoltcp::Error> {
         assert_eq!(0, buf.len(), "Given buffer should be empty.");
-        let mut tcp = self.socket.lock().await;
+        let mut guard = self.socket.lock().await;
+        let tcp = &mut guard.tcp;
         let r = tcp.dispatch(timestamp, capabilities, |(i, t)| {
             let p = Packet::Tcp((i, t));
             packet_to_bytes(p, &mut buf, &capabilities.checksum)?;
@@ -101,17 +105,21 @@ impl Connection {
             }
         }
         let poll_at = tcp.poll_at();
-        match tcp.poll_at() {
+        let active = match tcp.poll_at() {
             PollAt::Ingress => {
                 trace!("tcp socket becomes inactive");
+                false
             }
             PollAt::Now => {
                 trace!("tcp socket is still active");
+                true
             }
             PollAt::Time(instant) => {
                 trace!("tcp socket needs to be polled at {:?}", instant);
+                false
             }
-        }
+        };
+        guard.polling_active = active;
         send_poll.send(self.handle.clone(), poll_at);
         Ok(())
     }

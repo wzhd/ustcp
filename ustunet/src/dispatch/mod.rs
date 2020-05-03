@@ -133,6 +133,7 @@ impl Interface {
                     next_poll = Some(s);
                 }
             }
+            tokio::task::yield_now().await;
         }
     }
     /// Process incoming packet.

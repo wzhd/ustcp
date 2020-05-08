@@ -17,6 +17,7 @@ use tokio_fd::AsyncFd;
 
 pub(crate) mod poll_queue;
 
+use crate::dispatch::poll_queue::SocketChange;
 use poll_queue::DispatchQueue;
 
 type SMResult<T> = Result<T, smoltcp::Error>;
@@ -37,14 +38,14 @@ pub struct Interface {
 enum SelectValue {
     Read(usize),
     Written(usize),
-    NextPoll(SocketHandle),
+    NextPoll((SocketHandle, SocketChange)),
 }
 
 impl Interface {
     pub fn new(capabilities: DeviceCapabilities) -> (Interface, mpsc::Receiver<TcpStream>) {
         let clock = Clock::new();
-        let (queue, queue_sender) = DispatchQueue::new(clock);
-        let (pool, incoming) = SocketPool::new(queue_sender);
+        let (queue, queue_sender, shutdown_builder) = DispatchQueue::new(clock);
+        let (pool, incoming) = SocketPool::new(queue_sender, shutdown_builder);
         let interface = Interface {
             sockets: pool,
             capabilities,
@@ -82,12 +83,9 @@ impl Interface {
             }
             if write_buf.is_empty() {
                 if let Some(addr) = next_poll.take() {
-                    if let Err(e) = sockets
+                    sockets
                         .dispatch(&mut write_buf, timestamp, addr, &capabilities, queue)
-                        .await
-                    {
-                        error!("Tcp dispatch error {:?}", e);
-                    }
+                        .await;
                 }
             }
             let rf = reader.read(&mut read_buf).map_err(|e| {
@@ -97,7 +95,7 @@ impl Interface {
             let v = tokio::select! {
                 n = rf => SelectValue::Read(n?),
                 n = writer.write(&write_buf), if !write_buf.is_empty() => SelectValue::Written(n?),
-                p = queue.next(), if next_poll.is_none() => SelectValue::NextPoll(p),
+                p = queue.next(next_poll.is_none()) => SelectValue::NextPoll(p),
             };
             trace!("selected value {:?}", v);
             timestamp = clock.timestamp();
@@ -121,17 +119,24 @@ impl Interface {
                             }
                         }
                         Err(e) => {
-                            println!("process error {:?}", e);
+                            if e != smoltcp::Error::Dropped {
+                                warn!("process error {:?}", e);
+                            }
                         }
                     }
                 }
                 SelectValue::Written(_n) => {
                     write_buf.clear();
                 }
-                SelectValue::NextPoll(s) => {
-                    assert!(next_poll.is_none());
-                    next_poll = Some(s);
-                }
+                SelectValue::NextPoll((s, change)) => match change {
+                    SocketChange::Poll => {
+                        assert!(next_poll.is_none());
+                        next_poll = Some(s);
+                    }
+                    SocketChange::Shutdown(rw) => {
+                        sockets.drop_tcp_half(&s, rw, queue).await;
+                    }
+                },
             }
             tokio::task::yield_now().await;
         }

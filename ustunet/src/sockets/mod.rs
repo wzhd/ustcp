@@ -11,15 +11,17 @@ use log::{error, info};
 
 use super::mpsc::{self};
 
-use crate::dispatch::poll_queue::{DispatchQueue, QueueUpdater};
+use crate::dispatch::poll_queue::{DispatchQueue, QueueUpdater, Shutdown, ShutdownNotifierBuilder};
 use crate::stream::internal::Connection;
 
+use crate::dispatch::SocketHandle;
 use smoltcp::phy::DeviceCapabilities;
 use smoltcp::time::Instant;
 use smoltcp::wire::{IpRepr, TcpControl, TcpRepr};
+use std::fmt;
+use std::fmt::Formatter;
 
 /// An extensible set of sockets.
-#[derive(Debug)]
 #[allow(unused)]
 pub(crate) struct SocketPool {
     sockets: HashMap<AddrPair, Connection>,
@@ -27,6 +29,7 @@ pub(crate) struct SocketPool {
     new_conns: mpsc::Sender<TcpStream>,
     /// Queue a socket to be polled for egress after a period.
     send_poll: QueueUpdater,
+    shutdown_builder: ShutdownNotifierBuilder,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
@@ -38,13 +41,17 @@ pub struct AddrPair {
 
 impl SocketPool {
     /// Create a socket set using the provided storage.
-    pub fn new(send_poll: QueueUpdater) -> (SocketPool, mpsc::Receiver<TcpStream>) {
+    pub fn new(
+        send_poll: QueueUpdater,
+        shutdown_builder: ShutdownNotifierBuilder,
+    ) -> (SocketPool, mpsc::Receiver<TcpStream>) {
         let sockets = HashMap::new();
         let (tx, rx) = mpsc::channel(1);
         let s = SocketPool {
             sockets,
             new_conns: tx,
             send_poll,
+            shutdown_builder,
         };
         (s, rx)
     }
@@ -66,7 +73,7 @@ impl SocketPool {
         };
         let socket = if tcp_repr.control != TcpControl::Syn {
             self.sockets.get_mut(&pair).ok_or_else(|| {
-                warn!("No known socket for {:?}.", pair);
+                debug!("No known socket for {:?}.", pair);
                 smoltcp::Error::Dropped
             })?
         } else if let Some(num) = tcp_repr.ack_number {
@@ -88,15 +95,20 @@ impl SocketPool {
         addr: AddrPair,
         capabilities: &DeviceCapabilities,
         send_poll: &mut DispatchQueue,
-    ) -> Result<(), smoltcp::Error> {
+    ) {
         assert_eq!(0, buf.len(), "Given buffer should be empty.");
-        let socket = self.sockets.get_mut(&addr).ok_or_else(|| {
-            warn!("Address {:?} does not belong to a known socket.", addr);
-            smoltcp::Error::Dropped
-        })?;
-        socket
+        let socket = self
+            .sockets
+            .get_mut(&addr)
+            .expect("Dispatching should not happen after dropping.");
+        let drop = socket
             .dispatch(buf, timestamp, capabilities, send_poll)
-            .await
+            .await;
+        if drop {
+            debug!("Removing socket {:?} from collection.", addr);
+            self.sockets.remove(&addr).unwrap();
+            send_poll.remove(&addr);
+        }
     }
     /// Create a new connection in response to SYN.
     async fn new_connection(&mut self, pair: AddrPair) -> Result<&mut Connection, smoltcp::Error> {
@@ -108,12 +120,31 @@ impl SocketPool {
             return Err(smoltcp::Error::Dropped);
         }
         let socket = open_socket(pair.local)?;
-        let (tcp, connection) = TcpStream::new(socket, self.send_poll.clone(), pair.clone());
+        let (tcp, connection) = TcpStream::new(
+            socket,
+            self.send_poll.clone(),
+            pair.clone(),
+            &self.shutdown_builder,
+        );
         self.new_conns.send(tcp).await.unwrap_or_else(|error| {
             error!("tcp source {:?}", error);
         });
         self.sockets.insert(pair.clone(), connection);
         Ok(self.sockets.get_mut(&pair).unwrap())
+    }
+    /// Mark reader or writer as dropped.
+    pub(crate) async fn drop_tcp_half(
+        &mut self,
+        socket: &SocketHandle,
+        rw: Shutdown,
+        dispatch_queue: &mut DispatchQueue,
+    ) {
+        debug!("Dropping {:?} of {:?}", rw, socket);
+        let connection = self
+            .sockets
+            .get_mut(&socket)
+            .expect("Socket only gets removed after dropping both reader and writer.");
+        connection.drop_half(rw, dispatch_queue).await;
     }
 }
 
@@ -135,4 +166,11 @@ fn create_tcp_socket<'a>() -> TcpSocket<'a> {
     let tcp1_rx_buffer = TcpSocketBuffer::new(vec![0; RX_BUF_SIZE]);
     let tcp1_tx_buffer = TcpSocketBuffer::new(vec![0; TX_BUF_SIZE]);
     TcpSocket::new(tcp1_rx_buffer, tcp1_tx_buffer)
+}
+
+impl fmt::Debug for SocketPool {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        write!(f, "SocketPool")?;
+        Ok(())
+    }
 }

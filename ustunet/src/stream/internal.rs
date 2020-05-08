@@ -1,6 +1,6 @@
-use crate::dispatch::poll_queue::DispatchQueue;
+use crate::dispatch::poll_queue::{DispatchQueue, Shutdown};
 use crate::dispatch::{packet_to_bytes, SocketHandle};
-use crate::stream::{ReadinessState, Tcp, TcpLock, WriteReadiness};
+use crate::stream::{Inner, ReadinessState, Tcp, TcpLock, WriteReadiness};
 use smoltcp::iface::Packet;
 use smoltcp::phy::DeviceCapabilities;
 use smoltcp::socket::PollAt;
@@ -10,11 +10,16 @@ use smoltcp::wire::TcpRepr;
 use smoltcp::Error;
 use std::fmt;
 use std::fmt::Formatter;
+use std::ops::DerefMut;
 
 /// Reference to TcpSocket.
 /// Notify readers and writers after IO activities.
 pub(crate) struct Connection {
     pub(crate) socket: TcpLock,
+    inner: RwStatus,
+}
+
+struct RwStatus {
     /// Can be used as a key in key-value storage.
     handle: SocketHandle,
     /// Contains an optional Waker which would be set by the reader
@@ -23,6 +28,8 @@ pub(crate) struct Connection {
     /// Use to wake the writer when a full tx buffer has newly freed up space
     /// and can be written to again.
     write_readiness: WriteReadiness,
+    reader_dropped: bool,
+    writer_dropped: bool,
 }
 
 impl fmt::Debug for Connection {
@@ -38,12 +45,14 @@ impl Connection {
         read_readiness: ReadinessState,
         write_readiness: WriteReadiness,
     ) -> Connection {
-        Connection {
-            socket,
+        let inner = RwStatus {
             handle: addr,
             read_readiness,
             write_readiness,
-        }
+            writer_dropped: false,
+            reader_dropped: false,
+        };
+        Connection { socket, inner }
     }
     /// Process incoming packet and queue for polling.
     pub async fn process(
@@ -53,21 +62,23 @@ impl Connection {
         tcp_repr: &TcpRepr<'_>,
         send_poll: &mut DispatchQueue,
     ) -> Result<Option<(IpRepr, TcpRepr<'static>)>, Error> {
-        use std::ops::DerefMut;
+        let handle = self.handle().clone();
         let mut socket = self.socket.lock().await;
         let socket = &mut socket.deref_mut().tcp;
         check_acceptability(socket, ip_repr, tcp_repr)?;
         let reply = socket.process(timestamp, &ip_repr, &tcp_repr);
         if socket.can_recv() {
-            if let Some(waker) = self.read_readiness.lock().unwrap().waker.take() {
-                waker.wake();
-            }
+            self.inner.wake_reader();
         }
-        send_poll.send(self.handle.clone(), socket.poll_at());
+        self.inner.wake_to_close(socket);
+        let mut poll_at = socket.poll_at();
+        if self.inner.both_dropped() && poll_at == PollAt::Ingress && !send_poll.contains(&handle) {
+            poll_at = PollAt::Now;
+        }
+        send_poll.send(handle.clone(), poll_at);
         trace!("connection reply {:?}", reply);
         reply
     }
-
     /// Serialise outgoing packet and queue for next dispatch.
     /// Assumes the packet will be written to network device immediately.
     pub(crate) async fn dispatch(
@@ -76,8 +87,9 @@ impl Connection {
         timestamp: Instant,
         capabilities: &DeviceCapabilities,
         send_poll: &mut DispatchQueue,
-    ) -> Result<(), smoltcp::Error> {
+    ) -> bool {
         assert_eq!(0, buf.len(), "Given buffer should be empty.");
+        let handle = self.handle();
         let mut guard = self.socket.lock().await;
         let tcp = &mut guard.tcp;
         let r = tcp.dispatch(timestamp, capabilities, |(i, t)| {
@@ -91,37 +103,89 @@ impl Connection {
             }
             Ok(())
         });
-        match r {
-            Ok(()) => {}
-            Err(smoltcp::Error::Exhausted) => {
-                // smoltcp probably just has nothing to send
+        if let Err(error) = r {
+            if error != smoltcp::Error::Exhausted {
+                error!("Error in dispatch {:?}.", error);
             }
-            Err(error) => return Err(error),
         }
+        self.inner.wake_to_close(tcp);
         if tcp.can_send() {
-            if let Some(waker) = self.write_readiness.lock().unwrap().waker.take() {
-                trace!("Waking writer.");
-                waker.wake();
-            }
+            self.inner.wake_writer();
         }
         let poll_at = tcp.poll_at();
-        let active = match tcp.poll_at() {
-            PollAt::Ingress => {
-                trace!("tcp socket becomes inactive");
-                false
+        if self.inner.both_dropped() {
+            if !tcp.remote_endpoint().is_specified() {
+                debug!(
+                    "Disassociated from remote endpoint, dropping connection {:?}",
+                    handle
+                );
+                return true;
             }
-            PollAt::Now => {
-                trace!("tcp socket is still active");
-                true
+            if let Err(smoltcp::Error::Exhausted) = r {
+                debug!("Finished dispatching, dropping connection {:?}", handle);
+                return true;
             }
-            PollAt::Time(instant) => {
-                trace!("tcp socket needs to be polled at {:?}", instant);
-                false
+            if poll_at == PollAt::Ingress {
+                debug!(
+                    "Dropping connection {:?} to avoid waiting indefinitely.",
+                    handle
+                );
+                return true;
             }
-        };
-        guard.polling_active = active;
-        send_poll.send(self.handle.clone(), poll_at);
-        Ok(())
+        }
+        guard.polling_active = poll_at == PollAt::Now;
+        send_poll.send(handle, poll_at);
+        false
+    }
+    /// Mark reader or writer as dropped.
+    /// Returns whether the connection should be dropped.
+    pub(crate) async fn drop_half(&mut self, rw: Shutdown, dispatch_queue: &mut DispatchQueue) {
+        let handle = self.handle();
+        let Self { socket, inner } = self;
+        match rw {
+            Shutdown::Read => inner.reader_dropped = true,
+            Shutdown::Write => inner.writer_dropped = true,
+        }
+        if !inner.writer_dropped {
+            return;
+        }
+        let mut guard = socket.lock().await;
+        let Inner { tcp, .. } = guard.deref_mut();
+        tcp.close();
+        let mut poll_at = tcp.poll_at();
+        if inner.both_dropped() && poll_at == PollAt::Ingress {
+            poll_at = PollAt::Now;
+        }
+        dispatch_queue.send(handle, poll_at);
+    }
+    fn handle(&self) -> SocketHandle {
+        self.inner.handle.clone()
+    }
+}
+
+impl RwStatus {
+    /// Notify reader or writer after reaching the end.
+    /// TcpSocket state may change after either processing or dispatching.
+    fn wake_to_close(&mut self, socket: &mut Tcp) {
+        if !socket.may_recv() {
+            self.wake_reader();
+        }
+        if !socket.may_send() {
+            self.wake_writer();
+        }
+    }
+    fn wake_reader(&mut self) {
+        if !self.reader_dropped {
+            self.read_readiness.lock().unwrap().wake_once();
+        }
+    }
+    fn wake_writer(&mut self) {
+        if !self.writer_dropped {
+            self.write_readiness.lock().unwrap().wake_once();
+        }
+    }
+    fn both_dropped(&self) -> bool {
+        self.writer_dropped && self.reader_dropped
     }
 }
 

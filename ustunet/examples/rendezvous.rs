@@ -45,20 +45,29 @@ async fn main() {
 
 async fn copy_to_server(
     remote: SocketAddr,
-    mut socket: ustunet::stream::TcpStream,
+    socket: ustunet::stream::TcpStream,
 ) -> io::Result<(u64, u64)> {
     println!(
         "Accepted new tcp stream from {:?} to {:?}",
         socket.peer_addr(),
         socket.local_addr()
     );
-    let mut server = TcpStream::connect(&remote).await?;
+    let server = TcpStream::connect(&remote).await?;
     println!("Connected to {:?}", remote);
-    let (mut reader, mut writer) = server.split();
-    let sent = tokio::io::copy(&mut reader, &mut socket.writer);
-    let recv = tokio::io::copy(&mut socket.reader, &mut writer);
+    let (mut reader, mut writer) = server.into_split();
+    let (mut client_reader, mut client_writer) = socket.split();
+    let sent = tokio::spawn(async move {
+        let n = tokio::io::copy(&mut reader, &mut client_writer).await;
+        println!("Sent bytes: {:?}", n);
+        n
+    });
+    let recv = tokio::spawn(async move {
+        let n = tokio::io::copy(&mut client_reader, &mut writer).await;
+        println!("Received bytes: {:?}", n);
+        n
+    });
     let (sent, recv) = tokio::join!(sent, recv);
-    let sent = sent?;
-    let recv = recv?;
+    let sent = sent??;
+    let recv = recv??;
     Ok((sent, recv))
 }

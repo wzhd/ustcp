@@ -71,17 +71,21 @@ impl SocketPool {
             peer: src,
             local: dst,
         };
-        let socket = if tcp_repr.control != TcpControl::Syn {
-            self.sockets.get_mut(&pair).ok_or_else(|| {
-                debug!("No known socket for {:?}.", pair);
-                smoltcp::Error::Dropped
-            })?
-        } else if let Some(num) = tcp_repr.ack_number {
-            warn!("Syn with ack number ({:?}) is not expected.", num);
+        if tcp_repr.control == TcpControl::Syn && tcp_repr.ack_number.is_some() {
+            warn!(
+                "Syn with ack number {:?} is not expected.",
+                tcp_repr.ack_number
+            );
             return Err(smoltcp::Error::Dropped);
-        } else {
+        }
+        let socket = if let Some(s) = self.sockets.get_mut(&pair) {
+            s
+        } else if tcp_repr.control == TcpControl::Syn {
             debug!("creating socket {:?}", pair);
             self.new_connection(pair).await?
+        } else {
+            debug!("No known socket for {:?}.", pair);
+            return Err(smoltcp::Error::Dropped);
         };
         let reply = socket
             .process(timestamp, &ip_repr, &tcp_repr, send_poll)
@@ -112,13 +116,6 @@ impl SocketPool {
     }
     /// Create a new connection in response to SYN.
     async fn new_connection(&mut self, pair: AddrPair) -> Result<&mut Connection, smoltcp::Error> {
-        if self.sockets.contains_key(&pair) {
-            warn!(
-                "Connection {:?} already exists and closing a socket has not been implemented.",
-                pair
-            );
-            return Err(smoltcp::Error::Dropped);
-        }
         let socket = open_socket(pair.local)?;
         let (tcp, connection) = TcpStream::new(
             socket,
@@ -129,7 +126,8 @@ impl SocketPool {
         self.new_conns.send(tcp).await.unwrap_or_else(|error| {
             error!("tcp source {:?}", error);
         });
-        self.sockets.insert(pair.clone(), connection);
+        let prev = self.sockets.insert(pair.clone(), connection);
+        assert!(prev.is_none());
         Ok(self.sockets.get_mut(&pair).unwrap())
     }
     /// Mark reader or writer as dropped.

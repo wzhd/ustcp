@@ -2,7 +2,6 @@ use argh::FromArgs;
 use futures::StreamExt;
 use std::io;
 use std::net::SocketAddr;
-use std::str::FromStr;
 use tokio::net::TcpStream;
 use tracing_subscriber;
 use tracing_subscriber::EnvFilter;
@@ -13,15 +12,12 @@ use ustunet::TcpListener;
 /// Reach one server with arbitrary socket addresses.
 struct ConnectUp {
     /// address of server to connect to
-    #[argh(positional, default = "default_server_address()")]
+    #[argh(positional)]
     server: SocketAddr,
 
     /// tun device owned by current user
-    #[argh(option, default = "\"tuna\".into()")]
+    #[argh(option)]
     tun: String,
-}
-fn default_server_address() -> SocketAddr {
-    SocketAddr::from_str("127.0.0.1:5201").unwrap()
 }
 
 #[tokio::main]

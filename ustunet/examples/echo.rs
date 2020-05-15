@@ -10,12 +10,8 @@ use ustunet::TcpListener;
 /// Echoing server on every address.
 struct EchoUp {
     /// tun device owned by current user
-    #[argh(option, default = "default_tun_device()")]
+    #[argh(option)]
     tun: String,
-}
-
-fn default_tun_device() -> String {
-    "tuna".into()
 }
 
 #[tokio::main]

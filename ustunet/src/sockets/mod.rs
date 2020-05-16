@@ -158,7 +158,7 @@ fn open_socket(local: SocketAddr) -> Result<TcpSocket<'static>, smoltcp::Error> 
     Ok(socket)
 }
 
-const RX_BUF_SIZE: usize = 8192;
+const RX_BUF_SIZE: usize = 32768;
 const TX_BUF_SIZE: usize = RX_BUF_SIZE;
 fn create_tcp_socket<'a>() -> TcpSocket<'a> {
     let tcp1_rx_buffer = TcpSocketBuffer::new(vec![0; RX_BUF_SIZE]);

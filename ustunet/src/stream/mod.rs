@@ -5,10 +5,12 @@ use crate::dispatch::SocketHandle;
 use crate::sockets::AddrPair;
 use crate::stream::internal::Connection;
 use futures::future::poll_fn;
+use futures::io::Error;
 use futures::ready;
 use futures::task::Poll;
 use smoltcp::socket::TcpSocket;
 use smoltcp::socket::TcpState;
+use std::borrow::BorrowMut;
 use std::fmt;
 use std::fmt::Formatter;
 use std::io;
@@ -39,8 +41,8 @@ pub(crate) struct Inner {
 }
 
 pub struct TcpStream {
-    pub writer: WriteHalf,
-    pub reader: ReadHalf,
+    writer: WriteHalf,
+    reader: ReadHalf,
     /// Local and peer address.
     // Immutable.
     addr: AddrPair,
@@ -106,6 +108,12 @@ impl TcpStream {
         (tcp, connection)
     }
 
+    pub fn reader(&mut self) -> &mut ReadHalf {
+        &mut self.reader
+    }
+    pub fn writer(&mut self) -> &mut WriteHalf {
+        &mut self.writer
+    }
     /// Returns the local address that this TcpStream is bound to.
     pub fn local_addr(&self) -> SocketAddr {
         self.addr.local
@@ -123,6 +131,34 @@ impl TcpStream {
     /// Close the transmit half of the full-duplex connection.
     pub async fn close(&mut self) {
         self.writer.close().await;
+    }
+}
+
+impl AsyncRead for TcpStream {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut [u8],
+    ) -> Poll<io::Result<usize>> {
+        self.reader.poll_read_inner(cx, buf)
+    }
+}
+
+impl AsyncWrite for TcpStream {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<Result<usize, Error>> {
+        self.writer.poll_write_inner(cx, buf)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
+        self.writer.poll_close(cx).map(|_| Ok(()))
     }
 }
 
@@ -178,17 +214,22 @@ impl WriteHalf {
 
 impl AsyncRead for ReadHalf {
     fn poll_read(
-        self: Pin<&mut Self>,
+        mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &mut [u8],
     ) -> Poll<io::Result<usize>> {
-        use std::borrow::BorrowMut;
+        self.as_mut().poll_read_inner(cx, buf)
+    }
+}
+
+impl ReadHalf {
+    fn poll_read_inner(&mut self, cx: &mut Context<'_>, buf: &mut [u8]) -> Poll<io::Result<usize>> {
         let Self {
             ref mut mutex,
             ref mut shared_state,
             ref mut eof_reached,
             ..
-        } = self.get_mut();
+        } = self;
         let l = mutex.poll_lock(cx);
         let mut guard = ready!(l);
         let tcp = &mut guard.borrow_mut().tcp;
@@ -224,7 +265,26 @@ impl AsyncRead for ReadHalf {
 
 impl AsyncWrite for WriteHalf {
     fn poll_write(
-        self: Pin<&mut Self>,
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> task::Poll<io::Result<usize>> {
+        self.as_mut().poll_write_inner(cx, buf)
+    }
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
+        Poll::Ready(Ok(()))
+    }
+    fn poll_shutdown(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<(), io::Error>> {
+        ready!(self.poll_close(cx));
+        Poll::Ready(Ok(()))
+    }
+}
+impl WriteHalf {
+    fn poll_write_inner(
+        &mut self,
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> task::Poll<io::Result<usize>> {
@@ -234,7 +294,7 @@ impl AsyncWrite for WriteHalf {
             ref mut notifier,
             handle,
             ..
-        } = self.get_mut();
+        } = self;
         let p = mutex.poll_lock(cx);
         let mut guard = ready!(p);
         let inactive = !guard.polling_active;
@@ -260,18 +320,6 @@ impl AsyncWrite for WriteHalf {
         trace!("Setting waker for writer.");
         shared_state.lock().unwrap().waker = Some(cx.waker().clone());
         Poll::Pending
-    }
-
-    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
-        Poll::Ready(Ok(()))
-    }
-
-    fn poll_shutdown(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Result<(), io::Error>> {
-        ready!(self.poll_close(cx));
-        Poll::Ready(Ok(()))
     }
 }
 

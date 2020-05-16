@@ -25,14 +25,14 @@ async fn main() {
         let mut buf = vec![0u8; 1024];
         tokio::spawn(async move {
             loop {
-                let n = socket.reader.read(&mut buf).await.expect("read");
+                let n = socket.read(&mut buf).await.expect("read");
                 if n == 0 {
                     info!("stream closed");
                     break;
                 }
                 let content = &buf[..n];
                 eprintln!("read {:?} bytes: {:?}", n, content);
-                let n = socket.writer.write(content).await.expect("write failed");
+                let n = socket.write(content).await.expect("write failed");
                 println!("Written {} bytes", n);
             }
             eprintln!("connection ended");

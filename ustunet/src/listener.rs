@@ -10,7 +10,6 @@ use futures::task::Poll;
 use std::task::Context;
 use tokio::io::split;
 use tokio_fd::AsyncFd;
-use tun;
 use tun::Device as TunDevice;
 
 #[derive(Debug, Snafu)]

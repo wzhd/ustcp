@@ -144,6 +144,16 @@ impl AsyncRead for TcpStream {
     }
 }
 
+impl futures::io::AsyncRead for TcpStream {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut [u8],
+    ) -> Poll<io::Result<usize>> {
+        self.reader.poll_read_inner(cx, buf)
+    }
+}
+
 impl AsyncWrite for TcpStream {
     fn poll_write(
         mut self: Pin<&mut Self>,
@@ -158,7 +168,25 @@ impl AsyncWrite for TcpStream {
     }
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
-        self.writer.poll_close(cx).map(|_| Ok(()))
+        self.writer.poll_close_inner(cx).map(|_| Ok(()))
+    }
+}
+
+impl futures::io::AsyncWrite for TcpStream {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<Result<usize, Error>> {
+        self.writer.poll_write_inner(cx, buf)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
+        self.writer.poll_close_inner(cx).map(|_| Ok(()))
     }
 }
 
@@ -196,9 +224,9 @@ impl WriteHalf {
 
     /// Close the transmit half of the full-duplex connection.
     pub async fn close(&mut self) {
-        poll_fn(|cx| self.poll_close(cx)).await
+        poll_fn(|cx| self.poll_close_inner(cx)).await
     }
-    fn poll_close(&mut self, cx: &mut Context<'_>) -> Poll<()> {
+    fn poll_close_inner(&mut self, cx: &mut Context<'_>) -> Poll<()> {
         let mut guard = ready!(self.mutex.poll_lock(cx));
         let Inner {
             tcp,
@@ -213,6 +241,16 @@ impl WriteHalf {
 }
 
 impl AsyncRead for ReadHalf {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut [u8],
+    ) -> Poll<io::Result<usize>> {
+        self.as_mut().poll_read_inner(cx, buf)
+    }
+}
+
+impl futures::io::AsyncRead for ReadHalf {
     fn poll_read(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -278,10 +316,27 @@ impl AsyncWrite for WriteHalf {
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Result<(), io::Error>> {
-        ready!(self.poll_close(cx));
+        ready!(self.poll_close_inner(cx));
         Poll::Ready(Ok(()))
     }
 }
+impl futures::io::AsyncWrite for WriteHalf {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> task::Poll<io::Result<usize>> {
+        self.as_mut().poll_write_inner(cx, buf)
+    }
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
+        Poll::Ready(Ok(()))
+    }
+    fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
+        ready!(self.poll_close_inner(cx));
+        Poll::Ready(Ok(()))
+    }
+}
+
 impl WriteHalf {
     fn poll_write_inner(
         &mut self,

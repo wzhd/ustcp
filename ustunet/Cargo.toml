@@ -1,6 +1,6 @@
 [package]
 name = "ustunet"
-version = "0.1.0"
+version = "0.2.0"
 authors = ["wzhd"]
 edition="2018"
 
@@ -8,7 +8,9 @@ edition="2018"
 managed = { version = "0.7", default-features = false, features = ["map"] }
 log = "0.3"
 tun = { version = "0.4.4" }
-tokio-fd = "0.1.0"
+tokio-fd = "0.3.0"
+tokio-stream = "0.1"
+tokio-util = {version = "0.6.2", features = ["time"]}
 snafu = "0.6.3"
 futures = "0.3"
 tracing = "0.1"
@@ -22,15 +24,14 @@ path = "../ustcp"
 default-features=true
 
 [dependencies.tokio]
-version = "0.2"
+version = "1"
 features = [
   "sync",
   "time",
-  "rt-threaded",
+  "signal",
+  "rt-multi-thread",
   "io-util",
-  "io-driver",
-  "stream",
-  "tcp", # Only used in examples
+  "io-std",
   "macros",
 ]
 

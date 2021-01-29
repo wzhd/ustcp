@@ -21,7 +21,7 @@ use std::sync as std_sync;
 use std::sync::Arc;
 use std::task;
 use std::task::{Context, Waker};
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 pub(crate) type ReadinessState = Arc<std_sync::Mutex<SharedState>>;
 pub(crate) type WriteReadiness = Arc<std_sync::Mutex<SharedState>>;
@@ -138,9 +138,14 @@ impl AsyncRead for TcpStream {
     fn poll_read(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
-        buf: &mut [u8],
-    ) -> Poll<io::Result<usize>> {
-        self.reader.poll_read_inner(cx, buf)
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let b = buf.initialize_unfilled();
+        self.reader.poll_read_inner(cx, b).map(|o| {
+            o.map(|n| {
+                buf.advance(n)
+            })
+        })
     }
 }
 
@@ -244,9 +249,14 @@ impl AsyncRead for ReadHalf {
     fn poll_read(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
-        buf: &mut [u8],
-    ) -> Poll<io::Result<usize>> {
-        self.as_mut().poll_read_inner(cx, buf)
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let b = buf.initialize_unfilled();
+        self.as_mut().poll_read_inner(cx, b).map(|o| {
+            o.map(|n| {
+                buf.advance(n)
+            })
+        })
     }
 }
 

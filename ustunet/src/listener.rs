@@ -52,7 +52,7 @@ impl TcpListener {
     }
 }
 
-impl tokio::stream::Stream for TcpListener {
+impl tokio_stream::Stream for TcpListener {
     type Item = TcpStream;
 
     fn poll_next(

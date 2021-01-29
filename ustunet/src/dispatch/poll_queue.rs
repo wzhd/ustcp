@@ -7,9 +7,9 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::fmt::Formatter;
 use std::time::Instant;
-use tokio::stream::StreamExt;
-use tokio::sync::mpsc::error::TryRecvError;
-use tokio::time::{delay_queue::Key, DelayQueue};
+use tokio_stream::StreamExt;
+use tokio_util::time::{delay_queue::Key, DelayQueue};
+use futures::future::FutureExt;
 
 type PollDelay = Option<Instant>;
 
@@ -86,11 +86,11 @@ impl DispatchQueue {
     }
     /// Remove from channel to potentially save some memory.
     fn receive_poll_times(&mut self) {
-        loop {
-            match self.receiver.try_recv() {
-                Ok((s, p)) => self.insert(s, p),
-                Err(TryRecvError::Empty) => break,
-                Err(TryRecvError::Closed) => unreachable!("Always open in current implementation."),
+        while let Some(ready) = self.receiver.recv().now_or_never() {
+            if let Some((s,p)) = ready {
+                self.insert(s, p);
+            } else {
+                unreachable!("Always open in current implementation.");
             }
         }
     }

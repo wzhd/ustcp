@@ -1,3 +1,5 @@
+#[macro_use]
+extern crate log;
 use argh::FromArgs;
 use futures::StreamExt;
 use std::io;
@@ -32,8 +34,8 @@ async fn main() {
     while let Some(socket) = listener.next().await {
         tokio::spawn(async move {
             match copy_to_server(server, socket).await {
-                Ok((s, r)) => println!("Received {} bytes, sent {}", r, s),
-                Err(error) => println!("Error while copying: {:?}", error),
+                Ok((s, r)) => info!("Received {} bytes, sent {}", r, s),
+                Err(error) => error!("Error while copying: {:?}", error),
             }
         });
     }
@@ -43,23 +45,23 @@ async fn copy_to_server(
     remote: SocketAddr,
     socket: ustunet::stream::TcpStream,
 ) -> io::Result<(u64, u64)> {
-    println!(
+    info!(
         "Accepted new tcp stream from {:?} to {:?}",
         socket.peer_addr(),
         socket.local_addr()
     );
     let server = TcpStream::connect(&remote).await?;
-    println!("Connected to {:?}", remote);
+    info!("Connected to {:?}", remote);
     let (mut reader, mut writer) = server.into_split();
     let (mut client_reader, mut client_writer) = socket.split();
     let sent = tokio::spawn(async move {
         let n = tokio::io::copy(&mut reader, &mut client_writer).await;
-        println!("Sent bytes: {:?}", n);
+        info!("Sent bytes: {:?}", n);
         n
     });
     let recv = tokio::spawn(async move {
         let n = tokio::io::copy(&mut client_reader, &mut writer).await;
-        println!("Received bytes: {:?}", n);
+        info!("Received bytes: {:?}", n);
         n
     });
     let (sent, recv) = tokio::join!(sent, recv);

@@ -1,7 +1,7 @@
 use crate::dispatch::poll_queue::{DispatchQueue, Shutdown};
 use crate::dispatch::{packet_to_bytes, SocketHandle};
 use crate::stream::{Inner, ReadinessState, Tcp, TcpLock, WriteReadiness};
-use smoltcp::iface::Packet;
+use smoltcp::iface::IpPacket as Packet;
 use smoltcp::phy::DeviceCapabilities;
 use smoltcp::socket::PollAt;
 use smoltcp::time::Instant;

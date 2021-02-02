@@ -709,6 +709,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "smoltcp"
+version = "0.7.0"
+dependencies = [
+ "bitflags",
+ "byteorder",
+ "libc",
+ "log 0.4.8",
+ "managed",
+]
+
+[[package]]
 name = "snafu"
 version = "0.6.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1000,7 +1011,7 @@ dependencies = [
  "log 0.3.9",
  "managed",
  "pretty_env_logger",
- "smoltcp",
+ "smoltcp 0.7.0",
  "snafu",
  "tokio",
  "tokio-fd",

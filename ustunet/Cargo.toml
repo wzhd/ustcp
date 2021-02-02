@@ -20,7 +20,7 @@ tracing-futures = "0.2.4"
 git = "https://github.com/wzhd/trilock.git"
 
 [dependencies.smoltcp]
-path = "../ustcp"
+path = "../../smoltcp"
 default-features=true
 
 [dependencies.tokio]

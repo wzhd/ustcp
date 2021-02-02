@@ -3,7 +3,7 @@ use crate::sockets::{AddrPair, SocketPool};
 use crate::stream::TcpStream;
 use crate::time::Clock;
 use futures::TryFutureExt;
-use smoltcp::iface::Packet;
+use smoltcp::iface::IpPacket as Packet;
 use smoltcp::phy::{ChecksumCapabilities, DeviceCapabilities};
 use smoltcp::time::Instant;
 use smoltcp::wire::IpProtocol;

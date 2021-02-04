@@ -32,7 +32,7 @@ type Tcp = TcpSocket<'static>;
 type TcpLock = SocketLock<Inner>;
 
 pub(crate) struct Inner {
-    tcp: Tcp,
+    pub(crate) tcp: Tcp,
     /// Whether the connection is in queue to be dispatched.
     /// If true, data in the tx buffer will be sent out.
     /// If false, the dispatch queue should be notified

@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 
 pub use super::util::convert_to_socket_address;
-use smoltcp::socket::TcpSocket;
+use smoltcp::socket::{TcpSocket, TcpState};
 use smoltcp::socket::TcpSocketBuffer;
 
 use crate::stream::TcpStream;
@@ -79,6 +79,15 @@ impl SocketPool {
             return Err(smoltcp::Error::Dropped);
         }
         let socket = if let Some(s) = self.sockets.get_mut(&pair) {
+            if  tcp_repr.control == TcpControl::Syn {
+                {
+                    let k = s.socket.lock().await;
+                    let s = k.tcp.state();
+                    if s != TcpState::SynReceived {
+                        warn!("Received syn in state {:?} on {:?}", s, pair);
+                    }
+                }
+            }
             s
         } else if tcp_repr.control == TcpControl::Syn {
             debug!("creating socket {:?}", pair);

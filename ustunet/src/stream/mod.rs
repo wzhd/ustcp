@@ -1,7 +1,7 @@
 //! TcpStream and private structures.
 use super::SocketLock;
-use crate::dispatch::poll_queue::{QueueUpdater, ShutdownNotifier, ShutdownNotifierBuilder};
-use crate::dispatch::SocketHandle;
+use crate::dispatch::poll_queue::QueueUpdater;
+use crate::dispatch::{Close, CloseSender, HalfCloseSender, SocketHandle};
 use crate::sockets::AddrPair;
 use crate::stream::internal::Connection;
 use futures::future::poll_fn;
@@ -53,7 +53,7 @@ pub struct ReadHalf {
     shared_state: ReadinessState,
     eof_reached: bool,
     /// Send a message when getting dropped.
-    shutdown_notifier: ShutdownNotifier,
+    shutdown_notifier: HalfCloseSender,
 }
 
 pub struct WriteHalf {
@@ -61,7 +61,7 @@ pub struct WriteHalf {
     shared_state: ReadinessState,
     handle: SocketHandle,
     notifier: QueueUpdater,
-    shutdown_notifier: ShutdownNotifier,
+    shutdown_notifier: HalfCloseSender,
 }
 
 #[derive(Debug)]
@@ -84,20 +84,22 @@ impl TcpStream {
         tcp: Tcp,
         poll_queue: QueueUpdater,
         addr: AddrPair,
-        shutdown_builder: &ShutdownNotifierBuilder,
+        shutdown_builder: &CloseSender,
     ) -> (TcpStream, Connection) {
         let inner = Inner {
             tcp,
             polling_active: false,
         };
         let tcp_locks = SocketLock::new(inner);
-        let (reader, set_ready) =
-            ReadHalf::new(tcp_locks.0, shutdown_builder.reader_build(addr.clone()));
+        let (reader, set_ready) = ReadHalf::new(
+            tcp_locks.0,
+            shutdown_builder.build(addr.clone(), Close::Read),
+        );
         let (writer, write_readiness) = WriteHalf::new(
             tcp_locks.1,
             poll_queue,
             addr.clone(),
-            shutdown_builder.writer_build(addr.clone()),
+            shutdown_builder.build(addr.clone(), Close::Write),
         );
         let tcp = TcpStream {
             reader,
@@ -141,11 +143,9 @@ impl AsyncRead for TcpStream {
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
         let b = buf.initialize_unfilled();
-        self.reader.poll_read_inner(cx, b).map(|o| {
-            o.map(|n| {
-                buf.advance(n)
-            })
-        })
+        self.reader
+            .poll_read_inner(cx, b)
+            .map(|o| o.map(|n| buf.advance(n)))
     }
 }
 
@@ -196,7 +196,7 @@ impl futures::io::AsyncWrite for TcpStream {
 }
 
 impl ReadHalf {
-    fn new(socket: TcpLock, shutdown_notifier: ShutdownNotifier) -> (Self, ReadinessState) {
+    fn new(socket: TcpLock, shutdown_notifier: HalfCloseSender) -> (Self, ReadinessState) {
         let state = SharedState { waker: None };
         let shared_state = Arc::new(std_sync::Mutex::new(state));
         let s = ReadHalf {
@@ -214,7 +214,7 @@ impl WriteHalf {
         socket: TcpLock,
         notifier: QueueUpdater,
         handle: SocketHandle,
-        shutdown_notifier: ShutdownNotifier,
+        shutdown_notifier: HalfCloseSender,
     ) -> (Self, WriteReadiness) {
         let shared_state = Arc::new(std_sync::Mutex::new(SharedState { waker: None }));
         let s = Self {
@@ -252,11 +252,9 @@ impl AsyncRead for ReadHalf {
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
         let b = buf.initialize_unfilled();
-        self.as_mut().poll_read_inner(cx, b).map(|o| {
-            o.map(|n| {
-                buf.advance(n)
-            })
-        })
+        self.as_mut()
+            .poll_read_inner(cx, b)
+            .map(|o| o.map(|n| buf.advance(n)))
     }
 }
 

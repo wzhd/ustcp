@@ -3,18 +3,18 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 
 pub use super::util::convert_to_socket_address;
-use smoltcp::socket::{TcpSocket, TcpState};
 use smoltcp::socket::TcpSocketBuffer;
+use smoltcp::socket::{TcpSocket, TcpState};
 
 use crate::stream::TcpStream;
 use log::{error, info};
 
 use super::mpsc::{self};
 
-use crate::dispatch::poll_queue::{DispatchQueue, QueueUpdater, Shutdown, ShutdownNotifierBuilder};
+use crate::dispatch::poll_queue::{DispatchQueue, QueueUpdater};
 use crate::stream::internal::Connection;
 
-use crate::dispatch::SocketHandle;
+use crate::dispatch::{Close, CloseSender, SocketHandle};
 use smoltcp::phy::DeviceCapabilities;
 use smoltcp::time::Instant;
 use smoltcp::wire::{IpRepr, TcpControl, TcpRepr};
@@ -29,7 +29,7 @@ pub(crate) struct SocketPool {
     new_conns: mpsc::Sender<TcpStream>,
     /// Queue a socket to be polled for egress after a period.
     send_poll: QueueUpdater,
-    shutdown_builder: ShutdownNotifierBuilder,
+    shutdown_builder: CloseSender,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
@@ -43,7 +43,7 @@ impl SocketPool {
     /// Create a socket set using the provided storage.
     pub fn new(
         send_poll: QueueUpdater,
-        shutdown_builder: ShutdownNotifierBuilder,
+        shutdown_builder: CloseSender,
     ) -> (SocketPool, mpsc::Receiver<TcpStream>) {
         let sockets = HashMap::new();
         let (tx, rx) = mpsc::channel(1);
@@ -79,7 +79,7 @@ impl SocketPool {
             return Err(smoltcp::Error::Dropped);
         }
         let socket = if let Some(s) = self.sockets.get_mut(&pair) {
-            if  tcp_repr.control == TcpControl::Syn {
+            if tcp_repr.control == TcpControl::Syn {
                 {
                     let k = s.socket.lock().await;
                     let s = k.tcp.state();
@@ -143,7 +143,7 @@ impl SocketPool {
     pub(crate) async fn drop_tcp_half(
         &mut self,
         socket: &SocketHandle,
-        rw: Shutdown,
+        rw: Close,
         dispatch_queue: &mut DispatchQueue,
     ) {
         debug!("Dropping {:?} of {:?}", rw, socket);

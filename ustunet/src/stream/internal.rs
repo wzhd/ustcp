@@ -1,5 +1,5 @@
-use crate::dispatch::poll_queue::{DispatchQueue, Shutdown};
-use crate::dispatch::{packet_to_bytes, SocketHandle};
+use crate::dispatch::poll_queue::DispatchQueue;
+use crate::dispatch::{packet_to_bytes, Close, SocketHandle};
 use crate::stream::{Inner, ReadinessState, Tcp, TcpLock, WriteReadiness};
 use smoltcp::iface::IpPacket as Packet;
 use smoltcp::phy::DeviceCapabilities;
@@ -139,12 +139,12 @@ impl Connection {
     }
     /// Mark reader or writer as dropped.
     /// Returns whether the connection should be dropped.
-    pub(crate) async fn drop_half(&mut self, rw: Shutdown, dispatch_queue: &mut DispatchQueue) {
+    pub(crate) async fn drop_half(&mut self, rw: Close, dispatch_queue: &mut DispatchQueue) {
         let handle = self.handle();
         let Self { socket, inner } = self;
         match rw {
-            Shutdown::Read => inner.reader_dropped = true,
-            Shutdown::Write => inner.writer_dropped = true,
+            Close::Read => inner.reader_dropped = true,
+            Close::Write => inner.writer_dropped = true,
         }
         if !inner.writer_dropped {
             return;

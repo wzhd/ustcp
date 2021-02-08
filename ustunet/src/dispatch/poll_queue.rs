@@ -2,14 +2,12 @@ use super::super::mpsc;
 use super::SocketHandle;
 use crate::sockets::AddrPair;
 use crate::time::Clock;
+use futures::future::FutureExt;
 use smoltcp::socket::PollAt;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::fmt;
-use std::fmt::Formatter;
 use std::time::Instant;
 use tokio_stream::StreamExt;
 use tokio_util::time::{delay_queue::Key, DelayQueue};
-use futures::future::FutureExt;
 
 type PollDelay = Option<Instant>;
 
@@ -28,7 +26,6 @@ pub(crate) struct DispatchQueue {
     delayed: Delays,
     expired: ExpiredQueue,
     receiver: mpsc::UnboundedReceiver<PollUpdate>,
-    end_receiver: mpsc::UnboundedReceiver<(SocketHandle, Shutdown)>,
 }
 
 impl QueueUpdater {
@@ -42,26 +39,17 @@ impl QueueUpdater {
     }
 }
 
-#[derive(Debug)]
-pub(super) enum SocketChange {
-    Poll,
-    Shutdown(Shutdown),
-}
-
 impl DispatchQueue {
-    pub fn new(clock: Clock) -> (Self, QueueUpdater, ShutdownNotifierBuilder) {
+    pub fn new(clock: Clock) -> (Self, QueueUpdater) {
         let (sender, receiver) = mpsc::unbounded_channel();
-        let (end_sender, end_receiver) = mpsc::unbounded_channel();
         let queue = Self {
             clock,
             delayed: Delays::new(),
             expired: ExpiredQueue::new(),
             receiver,
-            end_receiver,
         };
         let updater = QueueUpdater { clock, sender };
-        let shutdown_builder = ShutdownNotifierBuilder { sender: end_sender };
-        (queue, updater, shutdown_builder)
+        (queue, updater)
     }
     pub fn send(&mut self, socket: SocketHandle, poll_at: PollAt) {
         match poll_at {
@@ -87,34 +75,31 @@ impl DispatchQueue {
     /// Remove from channel to potentially save some memory.
     fn receive_poll_times(&mut self) {
         while let Some(ready) = self.receiver.recv().now_or_never() {
-            if let Some((s,p)) = ready {
+            if let Some((s, p)) = ready {
                 self.insert(s, p);
             } else {
                 unreachable!("Always open in current implementation.");
             }
         }
     }
-    pub(super) async fn next(&mut self, get_dispatch: bool) -> (SocketHandle, SocketChange) {
+    pub(super) async fn next(&mut self, get_dispatch: bool) -> SocketHandle {
         self.receive_poll_times();
         loop {
             if get_dispatch {
                 if let Some(ready) = self.expired.pop() {
-                    return (ready, SocketChange::Poll);
+                    return ready;
                 }
             }
             tokio::select! {
                 expired = self.delayed.next(), if get_dispatch && !self.delayed.is_empty() => {
                     let s = expired.expect("DelayQueue should not be empty");
-                    return (s, SocketChange::Poll)
+                    return s
                 }
                 received = self.receiver.recv() => {
                     let (s, p) = received.expect("Should not be closed.");
                     self.insert(s, p);
                 }
-                s = self.end_receiver.recv() => {
-                    let (socket, shut) = s.unwrap();
-                    return (socket, SocketChange::Shutdown(shut))
-                }
+
             }
         }
     }
@@ -125,45 +110,6 @@ impl DispatchQueue {
     pub(crate) fn contains(&mut self, socket: &SocketHandle) -> bool {
         self.expired.contains(socket) || self.delayed.contains_key(socket)
     }
-}
-
-pub(crate) struct ShutdownNotifier {
-    socket: SocketHandle,
-    rw: Shutdown,
-    sender: mpsc::UnboundedSender<(SocketHandle, Shutdown)>,
-}
-
-impl ShutdownNotifier {
-    pub fn notify(&mut self) {
-        self.sender.send((self.socket.clone(), self.rw)).unwrap();
-    }
-}
-
-pub(crate) struct ShutdownNotifierBuilder {
-    sender: mpsc::UnboundedSender<(SocketHandle, Shutdown)>,
-}
-
-impl ShutdownNotifierBuilder {
-    pub fn reader_build(&self, socket: SocketHandle) -> ShutdownNotifier {
-        ShutdownNotifier {
-            sender: self.sender.clone(),
-            rw: Shutdown::Read,
-            socket,
-        }
-    }
-    pub fn writer_build(&self, socket: SocketHandle) -> ShutdownNotifier {
-        ShutdownNotifier {
-            sender: self.sender.clone(),
-            rw: Shutdown::Write,
-            socket,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug)]
-pub(crate) enum Shutdown {
-    Read,
-    Write,
 }
 
 struct Delays {
@@ -250,11 +196,5 @@ impl ExpiredQueue {
     }
     fn contains(&self, socket: &SocketHandle) -> bool {
         self.dispatch_set.contains(socket)
-    }
-}
-
-impl fmt::Debug for ShutdownNotifier {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        write!(f, "ShutdownNotifier({:?})", self.socket)
     }
 }

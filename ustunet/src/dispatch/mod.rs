@@ -2,15 +2,12 @@ use super::mpsc::{self};
 use crate::sockets::{AddrPair, SocketPool};
 use crate::stream::TcpStream;
 use crate::time::Clock;
-use futures::TryFutureExt;
 use smoltcp::iface::IpPacket as Packet;
 use smoltcp::phy::{ChecksumCapabilities, DeviceCapabilities};
 use smoltcp::time::Instant;
 use smoltcp::wire::IpProtocol;
 use smoltcp::wire::{IpRepr, Ipv4Packet, Ipv4Repr, TcpPacket, TcpRepr};
 use smoltcp::Error;
-use std::fmt;
-use std::fmt::Formatter;
 use std::io;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf};
 use tokio_fd::AsyncFd;
@@ -18,7 +15,11 @@ use tokio_fd::AsyncFd;
 pub(crate) mod poll_queue;
 mod shutdown;
 
+use crate::dispatch::poll_queue::{PollDelay, PollReceiver};
 use crate::dispatch::shutdown::shutdown_channel;
+use crate::util::{Selected, Selector};
+use futures::future::{self, Either};
+use futures::pin_mut;
 use poll_queue::DispatchQueue;
 pub(crate) use shutdown::{Close, CloseSender, HalfCloseSender};
 
@@ -36,20 +37,41 @@ pub struct Interface {
     /// Receive next socket to be polled for dispatch
     queue: DispatchQueue,
     closing: mpsc::UnboundedReceiver<(SocketHandle, Close)>,
+    poll_recv: PollReceiver,
 }
 
-enum SelectValue {
-    Read(usize),
-    Written(usize),
-    NextPoll(SocketHandle),
-    Close((SocketHandle, Close)),
+type ReadBuf = Box<[u8]>;
+async fn read_future(
+    mut reader: ReadHalf<AsyncFd>,
+    mut buf: ReadBuf,
+) -> (io::Result<usize>, ReadHalf<AsyncFd>, ReadBuf) {
+    let n = reader.read(&mut buf).await;
+    (n, reader, buf)
 }
 
+async fn write_future(
+    mut writer: WriteHalf<AsyncFd>,
+    buf: Vec<u8>,
+) -> (io::Result<usize>, WriteHalf<AsyncFd>, Vec<u8>) {
+    let n = writer.write(&buf).await;
+    (n, writer, buf)
+}
+
+type CloseReceiver = mpsc::UnboundedReceiver<(SocketHandle, Close)>;
+
+async fn recv_close(mut chan: CloseReceiver) -> (SocketHandle, Close, CloseReceiver) {
+    let (s, c) = chan.recv().await.expect("Channel closed.");
+    (s, c, chan)
+}
+async fn recv_poll(mut chan: PollReceiver) -> (SocketHandle, PollDelay, PollReceiver) {
+    let (s, c) = chan.recv().await.unwrap();
+    (s, c, chan)
+}
 impl Interface {
     pub fn new(capabilities: DeviceCapabilities) -> (Interface, mpsc::Receiver<TcpStream>) {
         let clock = Clock::new();
         let (shutdown_builder, closing) = shutdown_channel();
-        let (queue, queue_sender) = DispatchQueue::new(clock);
+        let (queue, queue_sender, poll_recv) = DispatchQueue::new(clock);
         let (pool, incoming) = SocketPool::new(queue_sender, shutdown_builder);
         let interface = Interface {
             sockets: pool,
@@ -57,59 +79,91 @@ impl Interface {
             clock: Clock::new(),
             queue,
             closing,
+            poll_recv,
         };
         (interface, incoming)
     }
 
     /// Keeps reading, processing, and writing
     pub async fn poll(
-        &mut self,
-        mut reader: ReadHalf<AsyncFd>,
-        mut writer: WriteHalf<AsyncFd>,
+        mut self,
+        reader: ReadHalf<AsyncFd>,
+        writer: WriteHalf<AsyncFd>,
     ) -> io::Result<()> {
         let Self {
-            sockets,
-            capabilities,
+            ref mut sockets,
+            ref capabilities,
             clock,
-            queue,
+            ref mut queue,
             closing,
+            poll_recv,
         } = self;
         let mut ingress_replies = vec![];
-        let mut next_poll = None;
-        let mut read_buf = vec![0u8; 2048];
-        let mut write_buf = Vec::with_capacity(2048);
+        let mut writing = Some((writer, Vec::with_capacity(2048)));
         let mut timestamp = clock.timestamp();
+        let mut selector = Selector::new();
+        selector.insert_b(read_future(reader, vec![0u8; 2048].into_boxed_slice()));
+        selector.insert_c(recv_close(closing));
+        selector.insert_d(recv_poll(poll_recv));
+        let mut next_poll = None;
         loop {
-            if write_buf.is_empty() {
-                while let Some(r) = ingress_replies.pop() {
-                    packet_to_bytes(r, &mut write_buf, &capabilities.checksum).unwrap();
-                    if !write_buf.is_empty() {
-                        break;
+            assert!(selector.b().is_some());
+            if let Some((writer, mut write_buf)) = writing.take() {
+                if write_buf.is_empty() {
+                    while let Some(r) = ingress_replies.pop() {
+                        packet_to_bytes(r, &mut write_buf, &capabilities.checksum).unwrap();
+                        if !write_buf.is_empty() {
+                            break;
+                        }
                     }
                 }
-            }
-            if write_buf.is_empty() {
-                if let Some(addr) = next_poll.take() {
-                    sockets
-                        .dispatch(&mut write_buf, timestamp, addr, &capabilities, queue)
-                        .await;
+                if write_buf.is_empty() {
+                    if let Some(addr) = next_poll.take() {
+                        sockets
+                            .dispatch(&mut write_buf, timestamp, addr, &capabilities, queue)
+                            .await;
+                    }
                 }
-            }
-            let rf = reader.read(&mut read_buf).map_err(|e| {
-                error!("Read error: {:?}", e);
-                e
-            });
-            let v = tokio::select! {
-                n = rf => SelectValue::Read(n?),
-                n = writer.write(&write_buf), if !write_buf.is_empty() => SelectValue::Written(n?),
-                p = queue.next(next_poll.is_none()) => SelectValue::NextPoll(p),
-                c = closing.recv() => SelectValue::Close(c.expect("Channel closed.")),
+                if !write_buf.is_empty() {
+                    let f = write_future(writer, write_buf);
+                    selector.insert_a(f);
+                } else {
+                    info!("nothing to write");
+                    writing = Some((writer, write_buf));
+                }
             };
-            trace!("selected value {:?}", v);
+            let se = selector.select();
+            let s = {
+                let nopoll = next_poll.is_none();
+                let wp = async {
+                    if nopoll {
+                        queue.poll().await
+                    } else {
+                        future::pending().await
+                    }
+                };
+                pin_mut!(se);
+                pin_mut!(wp);
+                match futures::future::select(se, wp).await {
+                    Either::Left((s, _w)) => s,
+                    Either::Right((expired, _se)) => {
+                        let addr = expired.into_inner();
+                        next_poll = Some(addr);
+                        continue;
+                    }
+                }
+            };
             timestamp = clock.timestamp();
-            match v {
-                SelectValue::Read(n) => {
-                    trace!("ingress  packet size: {}", n);
+            match s {
+                Selected::A((n, w, mut b)) => {
+                    let n = n?;
+                    info!("Written {} bytes", n);
+                    b.clear();
+                    writing = Some((w, b));
+                }
+                Selected::B((n, r, read_buf)) => {
+                    let n = n?;
+                    info!("ingress  packet size: {}", n);
                     match Self::process(
                         &capabilities.checksum,
                         sockets,
@@ -132,16 +186,16 @@ impl Interface {
                             }
                         }
                     }
+                    selector.insert_b(read_future(r, read_buf));
                 }
-                SelectValue::Written(_n) => {
-                    write_buf.clear();
+                Selected::C((s, c, r)) => {
+                    info!("Closing {:?}'s {:?}", s, c);
+                    sockets.drop_tcp_half(&s, c, queue).await;
+                    selector.insert_c(recv_close(r));
                 }
-                SelectValue::NextPoll(s) => {
-                    assert!(next_poll.is_none());
-                    next_poll = Some(s);
-                }
-                SelectValue::Close((s, rw)) => {
-                    sockets.drop_tcp_half(&s, rw, queue).await;
+                Selected::D((s, t, p)) => {
+                    queue.insert(s, t);
+                    selector.insert_d(recv_poll(p));
                 }
             }
             tokio::task::yield_now().await;
@@ -243,16 +297,4 @@ pub(crate) fn packet_to_bytes(
         }
     }
     Ok(())
-}
-
-impl fmt::Debug for SelectValue {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        use SelectValue::*;
-        match self {
-            Read(n) => write!(f, "Read({:?} bytes)", n),
-            Written(n) => write!(f, "Written({:?} bytes)", n),
-            NextPoll(s) => write!(f, "Polling({:?})", s),
-            Close(s) => write!(f, "Closing({:?})", s),
-        }
-    }
 }

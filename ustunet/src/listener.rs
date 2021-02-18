@@ -30,13 +30,13 @@ impl TcpListener {
         let name = name.as_ref();
         conf.name(name);
         let d = tun::create(&conf).context(Tun { name })?;
-
+        let mtu = d.mtu().context(Tun { name })? as usize;
         let mut capabilities = DeviceCapabilities::default();
-        capabilities.max_transmission_unit = d.mtu().context(Tun { name })? as usize;
+        capabilities.max_transmission_unit = mtu;
         let fd = d.into_raw_fd();
         let fd = AsyncFd::try_from(fd).unwrap();
         let (rd, wr) = split(fd);
-        let (mut interface, connections) = Interface::new(capabilities);
+        let (interface, connections) = Interface::new(capabilities);
         tokio::spawn(async move {
             if let Err(e) = interface.poll(rd, wr).await {
                 error!("{:?}", e);

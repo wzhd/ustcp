@@ -5,7 +5,7 @@ mod listener;
 mod sockets;
 pub mod stream;
 mod time;
-mod util;
+pub(crate) mod util;
 use snafu::Snafu;
 
 pub use listener::TcpListener;

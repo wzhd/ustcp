@@ -11,15 +11,13 @@ use std::time::Instant;
 use tokio_util::time::delay_queue::{Expired, Key};
 use tokio_util::time::DelayQueue;
 
-pub(super) type PollDelay = Option<Instant>;
 pub(super) type PollReceiver = mpsc::UnboundedReceiver<PollUpdate>;
 /// Update the timing for polling a socket for retransmission.
-pub(crate) type PollUpdate = (SocketHandle, PollDelay);
+pub(crate) type PollUpdate = (SocketHandle, PollAt);
 
 /// Used to send updated polling delay to the queue.
 #[derive(Clone, Debug)]
 pub(crate) struct QueueUpdater {
-    clock: Clock,
     sender: mpsc::UnboundedSender<PollUpdate>,
 }
 
@@ -30,12 +28,7 @@ pub(crate) struct DispatchQueue {
 
 impl QueueUpdater {
     pub fn send(&mut self, socket: SocketHandle, poll_at: PollAt) {
-        let delay = match poll_at {
-            PollAt::Now => None,
-            PollAt::Time(millis) => Some(self.clock.resolve(millis)),
-            PollAt::Ingress => return,
-        };
-        self.sender.send((socket, delay)).unwrap();
+        self.sender.send((socket, poll_at)).unwrap();
     }
 }
 
@@ -46,20 +39,16 @@ impl DispatchQueue {
             clock,
             delayed: Delays::new(),
         };
-        let updater = QueueUpdater { clock, sender };
+        let updater = QueueUpdater { sender };
         (queue, updater, receiver)
     }
     pub fn send(&mut self, socket: SocketHandle, poll_at: PollAt) {
         let instant = match poll_at {
-            PollAt::Now => Instant::now(),
+            PollAt::Now => self.clock.origin(),
             PollAt::Time(millis) => self.clock.resolve(millis),
             PollAt::Ingress => return,
         };
         self.delayed.insert(socket, instant);
-    }
-    pub(crate) fn insert(&mut self, socket: SocketHandle, time: Option<Instant>) {
-        let t = time.unwrap_or_else(Instant::now);
-        self.delayed.insert(socket, t);
     }
     pub(crate) async fn poll(&mut self) -> Expired<SocketHandle> {
         let n = self.delayed.next().await;

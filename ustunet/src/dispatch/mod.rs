@@ -15,13 +15,14 @@ use tokio_fd::AsyncFd;
 pub(crate) mod poll_queue;
 mod shutdown;
 
-use crate::dispatch::poll_queue::{PollDelay, PollReceiver};
+use crate::dispatch::poll_queue::PollReceiver;
 use crate::dispatch::shutdown::shutdown_channel;
 use crate::util::{Selected, Selector};
 use futures::future::{self, Either};
 use futures::pin_mut;
 use poll_queue::DispatchQueue;
 pub(crate) use shutdown::{Close, CloseSender, HalfCloseSender};
+use smoltcp::socket::PollAt;
 
 type SMResult<T> = Result<T, smoltcp::Error>;
 type ProcessingReply = Option<(IpRepr, TcpRepr<'static>)>;
@@ -63,7 +64,7 @@ async fn recv_close(mut chan: CloseReceiver) -> (SocketHandle, Close, CloseRecei
     let (s, c) = chan.recv().await.expect("Channel closed.");
     (s, c, chan)
 }
-async fn recv_poll(mut chan: PollReceiver) -> (SocketHandle, PollDelay, PollReceiver) {
+async fn recv_poll(mut chan: PollReceiver) -> (SocketHandle, PollAt, PollReceiver) {
     let (s, c) = chan.recv().await.unwrap();
     (s, c, chan)
 }
@@ -194,7 +195,7 @@ impl Interface {
                     selector.insert_c(recv_close(r));
                 }
                 Selected::D((s, t, p)) => {
-                    queue.insert(s, t);
+                    queue.send(s, t);
                     selector.insert_d(recv_poll(p));
                 }
             }

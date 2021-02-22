@@ -13,6 +13,9 @@ impl Clock {
             start_time: Instant::now(),
         }
     }
+    pub fn origin(&self) -> Instant {
+        self.start_time
+    }
     /// Returns a wrapper around a `i64` value that
     /// represents the number of milliseconds since start_time.
     pub fn timestamp(&self) -> SmolInstant {

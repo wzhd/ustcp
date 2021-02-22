@@ -16,7 +16,7 @@ use crate::stream::internal::Connection;
 
 use crate::dispatch::{Close, CloseSender, SocketHandle};
 use smoltcp::phy::DeviceCapabilities;
-use smoltcp::time::Instant;
+use smoltcp::time::{Instant, Duration};
 use smoltcp::wire::{IpRepr, TcpControl, TcpRepr};
 use std::fmt;
 use std::fmt::Formatter;
@@ -164,6 +164,7 @@ fn open_socket(local: SocketAddr) -> Result<TcpSocket<'static>, smoltcp::Error> 
             e
         })?;
     }
+    socket.set_ack_delay(Some(Duration::from_millis(0)));
     Ok(socket)
 }
 

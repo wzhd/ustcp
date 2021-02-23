@@ -15,21 +15,25 @@ use crate::dispatch::poll_queue::{DispatchQueue, QueueUpdater};
 use crate::stream::internal::Connection;
 
 use crate::dispatch::{Close, CloseSender, SocketHandle};
+use crate::time::Clock;
 use smoltcp::phy::DeviceCapabilities;
-use smoltcp::time::{Instant, Duration};
+use smoltcp::time::Duration;
 use smoltcp::wire::{IpRepr, TcpControl, TcpRepr};
 use std::fmt;
 use std::fmt::Formatter;
+use tokio::sync::mpsc::Sender;
 
 /// An extensible set of sockets.
-#[allow(unused)]
 pub(crate) struct SocketPool {
+    pub(crate) queue: DispatchQueue,
     sockets: HashMap<AddrPair, Connection>,
     /// Received tcp connections.
     new_conns: mpsc::Sender<TcpStream>,
     /// Queue a socket to be polled for egress after a period.
     send_poll: QueueUpdater,
     shutdown_builder: CloseSender,
+    capabilities: DeviceCapabilities,
+    clock: Clock,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
@@ -44,16 +48,21 @@ impl SocketPool {
     pub fn new(
         send_poll: QueueUpdater,
         shutdown_builder: CloseSender,
-    ) -> (SocketPool, mpsc::Receiver<TcpStream>) {
+        capabilities: DeviceCapabilities,
+        tx: Sender<TcpStream>,
+        queue: DispatchQueue,
+        clock: Clock,
+    ) -> SocketPool {
         let sockets = HashMap::new();
-        let (tx, rx) = mpsc::channel(1);
-        let s = SocketPool {
+        SocketPool {
             sockets,
             new_conns: tx,
             send_poll,
             shutdown_builder,
-        };
-        (s, rx)
+            capabilities,
+            clock,
+            queue,
+        }
     }
 
     /// Find or create socket and process the incoming packet.
@@ -61,8 +70,6 @@ impl SocketPool {
         &mut self,
         ip_repr: IpRepr,
         tcp_repr: TcpRepr<'_>,
-        timestamp: Instant,
-        send_poll: &mut DispatchQueue,
     ) -> Result<Option<(IpRepr, TcpRepr<'static>)>, smoltcp::Error> {
         let (src_addr, dst_addr) = (ip_repr.src_addr(), ip_repr.dst_addr());
         let src = convert_to_socket_address(src_addr, tcp_repr.src_port)?;
@@ -78,7 +85,46 @@ impl SocketPool {
             );
             return Err(smoltcp::Error::Dropped);
         }
-        let socket = if let Some(s) = self.sockets.get_mut(&pair) {
+        let ts = self.clock.timestamp();
+        self.create_syn(&pair, tcp_repr).await?;
+        let socket = self.sockets.get_mut(&pair).unwrap();
+        let reply = socket
+            .process(ts, &ip_repr, &tcp_repr, &mut self.queue)
+            .await?;
+        Ok(reply)
+    }
+    pub(crate) async fn dispatch(&mut self, buf: &mut Vec<u8>, addr: AddrPair) {
+        assert_eq!(0, buf.len(), "Given buffer should be empty.");
+        let timestamp = self.clock.timestamp();
+        let socket = self
+            .sockets
+            .get_mut(&addr)
+            .expect("Dispatching should not happen after dropping.");
+        let drop = socket
+            .dispatch(buf, timestamp, &self.capabilities, &mut self.queue)
+            .await;
+        if drop {
+            debug!("Removing socket {:?} from collection.", addr);
+            self.sockets.remove(&addr).unwrap();
+            self.queue.remove(&addr);
+        }
+    }
+    /// Mark reader or writer as dropped.
+    pub(crate) async fn drop_tcp_half(&mut self, socket: &SocketHandle, rw: Close) {
+        debug!("Dropping {:?} of {:?}", rw, socket);
+        let connection = self
+            .sockets
+            .get_mut(&socket)
+            .expect("Socket only gets removed after dropping both reader and writer.");
+        connection.drop_half(rw, &mut self.queue).await;
+    }
+
+    async fn create_syn(
+        &mut self,
+        pair: &AddrPair,
+        tcp_repr: TcpRepr<'_>,
+    ) -> Result<(), smoltcp::Error> {
+        if let Some(s) = self.sockets.get_mut(pair) {
             if tcp_repr.control == TcpControl::Syn {
                 {
                     let k = s.socket.lock().await;
@@ -88,70 +134,25 @@ impl SocketPool {
                     }
                 }
             }
-            s
         } else if tcp_repr.control == TcpControl::Syn {
             debug!("creating socket {:?}", pair);
-            self.new_connection(pair).await?
+            let socket = open_socket(pair.local)?;
+            let (tcp, connection) = TcpStream::new(
+                socket,
+                self.send_poll.clone(),
+                pair.clone(),
+                &self.shutdown_builder,
+            );
+            self.new_conns.send(tcp).await.unwrap_or_else(|error| {
+                error!("tcp source {:?}", error);
+            });
+            let prev = self.sockets.insert(pair.clone(), connection);
+            assert!(prev.is_none());
         } else {
             debug!("No known socket for {:?}.", pair);
             return Err(smoltcp::Error::Dropped);
-        };
-        let reply = socket
-            .process(timestamp, &ip_repr, &tcp_repr, send_poll)
-            .await?;
-        Ok(reply)
-    }
-    pub(crate) async fn dispatch(
-        &mut self,
-        buf: &mut Vec<u8>,
-        timestamp: Instant,
-        addr: AddrPair,
-        capabilities: &DeviceCapabilities,
-        send_poll: &mut DispatchQueue,
-    ) {
-        assert_eq!(0, buf.len(), "Given buffer should be empty.");
-        let socket = self
-            .sockets
-            .get_mut(&addr)
-            .expect("Dispatching should not happen after dropping.");
-        let drop = socket
-            .dispatch(buf, timestamp, capabilities, send_poll)
-            .await;
-        if drop {
-            debug!("Removing socket {:?} from collection.", addr);
-            self.sockets.remove(&addr).unwrap();
-            send_poll.remove(&addr);
         }
-    }
-    /// Create a new connection in response to SYN.
-    async fn new_connection(&mut self, pair: AddrPair) -> Result<&mut Connection, smoltcp::Error> {
-        let socket = open_socket(pair.local)?;
-        let (tcp, connection) = TcpStream::new(
-            socket,
-            self.send_poll.clone(),
-            pair.clone(),
-            &self.shutdown_builder,
-        );
-        self.new_conns.send(tcp).await.unwrap_or_else(|error| {
-            error!("tcp source {:?}", error);
-        });
-        let prev = self.sockets.insert(pair.clone(), connection);
-        assert!(prev.is_none());
-        Ok(self.sockets.get_mut(&pair).unwrap())
-    }
-    /// Mark reader or writer as dropped.
-    pub(crate) async fn drop_tcp_half(
-        &mut self,
-        socket: &SocketHandle,
-        rw: Close,
-        dispatch_queue: &mut DispatchQueue,
-    ) {
-        debug!("Dropping {:?} of {:?}", rw, socket);
-        let connection = self
-            .sockets
-            .get_mut(&socket)
-            .expect("Socket only gets removed after dropping both reader and writer.");
-        connection.drop_half(rw, dispatch_queue).await;
+        Ok(())
     }
 }
 

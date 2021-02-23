@@ -1,4 +1,3 @@
-use super::dispatch::Interface;
 use super::stream::TcpStream;
 use smoltcp::phy::DeviceCapabilities;
 use snafu::{ResultExt, Snafu};
@@ -6,6 +5,7 @@ use std::convert::TryFrom;
 use std::os::unix::io::IntoRawFd;
 
 use super::mpsc::Receiver;
+use crate::dispatch::start_io;
 use futures::task::Poll;
 use std::task::Context;
 use tokio::io::split;
@@ -36,12 +36,7 @@ impl TcpListener {
         let fd = d.into_raw_fd();
         let fd = AsyncFd::try_from(fd).unwrap();
         let (rd, wr) = split(fd);
-        let (interface, connections) = Interface::new(capabilities);
-        tokio::spawn(async move {
-            if let Err(e) = interface.poll(rd, wr).await {
-                error!("{:?}", e);
-            }
-        });
+        let (_interface, connections) = start_io(capabilities, rd, wr);
         let listener = TcpListener {
             receiver: connections,
         };

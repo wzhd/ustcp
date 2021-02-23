@@ -4,7 +4,6 @@ use crate::stream::TcpStream;
 use crate::time::Clock;
 use smoltcp::iface::IpPacket as Packet;
 use smoltcp::phy::{ChecksumCapabilities, DeviceCapabilities};
-use smoltcp::time::Instant;
 use smoltcp::wire::IpProtocol;
 use smoltcp::wire::{IpRepr, Ipv4Packet, Ipv4Repr, TcpPacket, TcpRepr};
 use smoltcp::Error;
@@ -18,11 +17,13 @@ mod shutdown;
 use crate::dispatch::poll_queue::PollReceiver;
 use crate::dispatch::shutdown::shutdown_channel;
 use crate::util::{Selected, Selector};
-use futures::future::{self, Either};
+use futures::future::Either;
 use futures::pin_mut;
 use poll_queue::DispatchQueue;
 pub(crate) use shutdown::{Close, CloseSender, HalfCloseSender};
 use smoltcp::socket::PollAt;
+use tokio::sync::mpsc::Sender;
+use tokio::task::JoinHandle;
 
 type SMResult<T> = Result<T, smoltcp::Error>;
 type ProcessingReply = Option<(IpRepr, TcpRepr<'static>)>;
@@ -33,12 +34,7 @@ pub(crate) type SocketHandle = AddrPair;
 
 pub struct Interface {
     sockets: SocketPool,
-    capabilities: DeviceCapabilities,
-    clock: Clock,
-    /// Receive next socket to be polled for dispatch
-    queue: DispatchQueue,
-    closing: mpsc::UnboundedReceiver<(SocketHandle, Close)>,
-    poll_recv: PollReceiver,
+    checksum_caps: ChecksumCapabilities,
 }
 
 type ReadBuf = Box<[u8]>;
@@ -68,81 +64,75 @@ async fn recv_poll(mut chan: PollReceiver) -> (SocketHandle, PollAt, PollReceive
     let (s, c) = chan.recv().await.unwrap();
     (s, c, chan)
 }
-impl Interface {
-    pub fn new(capabilities: DeviceCapabilities) -> (Interface, mpsc::Receiver<TcpStream>) {
-        let clock = Clock::new();
-        let (shutdown_builder, closing) = shutdown_channel();
-        let (queue, queue_sender, poll_recv) = DispatchQueue::new(clock);
-        let (pool, incoming) = SocketPool::new(queue_sender, shutdown_builder);
-        let interface = Interface {
-            sockets: pool,
-            capabilities,
-            clock: Clock::new(),
-            queue,
-            closing,
-            poll_recv,
-        };
-        (interface, incoming)
-    }
 
-    /// Keeps reading, processing, and writing
-    pub async fn poll(
-        mut self,
-        reader: ReadHalf<AsyncFd>,
-        writer: WriteHalf<AsyncFd>,
-    ) -> io::Result<()> {
-        let Self {
-            ref mut sockets,
-            ref capabilities,
-            clock,
-            ref mut queue,
-            closing,
-            poll_recv,
-        } = self;
-        let mut ingress_replies = vec![];
-        let mut writing = Some((writer, Vec::with_capacity(2048)));
-        let mut timestamp = clock.timestamp();
-        let mut selector = Selector::new();
-        selector.insert_b(read_future(reader, vec![0u8; 2048].into_boxed_slice()));
-        selector.insert_c(recv_close(closing));
-        selector.insert_d(recv_poll(poll_recv));
-        let mut next_poll = None;
-        loop {
-            assert!(selector.b().is_some());
-            if let Some((writer, mut write_buf)) = writing.take() {
-                if write_buf.is_empty() {
-                    while let Some(r) = ingress_replies.pop() {
-                        packet_to_bytes(r, &mut write_buf, &capabilities.checksum).unwrap();
-                        if !write_buf.is_empty() {
-                            break;
-                        }
+pub(crate) fn start_io(
+    dev_caps: DeviceCapabilities,
+    reader: ReadHalf<AsyncFd>,
+    writer: WriteHalf<AsyncFd>,
+) -> (JoinHandle<io::Result<()>>, mpsc::Receiver<TcpStream>) {
+    let (tx, incoming) = mpsc::channel(1);
+    let t = tokio::spawn(async move { io_loop(dev_caps, reader, writer, tx).await });
+    (t, incoming)
+}
+
+async fn io_loop(
+    dev_caps: DeviceCapabilities,
+    reader: ReadHalf<AsyncFd>,
+    writer: WriteHalf<AsyncFd>,
+    tx: Sender<TcpStream>,
+) -> io::Result<()> {
+    let clock = Clock::new();
+    let (shutdown_builder, closing) = shutdown_channel();
+    let (queue, queue_sender, poll_recv) = DispatchQueue::new(clock);
+    let sockets = SocketPool::new(
+        queue_sender,
+        shutdown_builder,
+        dev_caps.clone(),
+        tx,
+        queue,
+        clock,
+    );
+    let mut ingress_replies = vec![];
+    let mut writing = Some((writer, Vec::with_capacity(2048)));
+    let mut selector = Selector::new();
+    selector.insert_b(read_future(reader, vec![0u8; 2048].into_boxed_slice()));
+    selector.insert_c(recv_close(closing));
+    selector.insert_d(recv_poll(poll_recv));
+    let mut next_poll = None;
+    let capabilities = dev_caps.clone();
+    let mut interface = Interface {
+        sockets,
+        checksum_caps: dev_caps.checksum.clone(),
+    };
+    loop {
+        assert!(selector.b().is_some());
+        if let Some((writer, mut write_buf)) = writing.take() {
+            if write_buf.is_empty() {
+                while let Some(r) = ingress_replies.pop() {
+                    packet_to_bytes(r, &mut write_buf, &capabilities.checksum).unwrap();
+                    if !write_buf.is_empty() {
+                        break;
                     }
                 }
-                if write_buf.is_empty() {
-                    if let Some(addr) = next_poll.take() {
-                        sockets
-                            .dispatch(&mut write_buf, timestamp, addr, &capabilities, queue)
-                            .await;
-                    }
+            }
+            if write_buf.is_empty() {
+                if let Some(addr) = next_poll.take() {
+                    interface.dispatch(&mut write_buf, addr).await;
                 }
-                if !write_buf.is_empty() {
-                    let f = write_future(writer, write_buf);
-                    selector.insert_a(f);
-                } else {
-                    info!("nothing to write");
-                    writing = Some((writer, write_buf));
-                }
-            };
-            let se = selector.select();
-            let s = {
-                let nopoll = next_poll.is_none();
-                let wp = async {
-                    if nopoll {
-                        queue.poll().await
-                    } else {
-                        future::pending().await
-                    }
-                };
+            }
+            if !write_buf.is_empty() {
+                let f = write_future(writer, write_buf);
+                selector.insert_a(f);
+            } else {
+                info!("nothing to write");
+                writing = Some((writer, write_buf));
+            }
+        };
+        let se = selector.select();
+        let s = {
+            let nopoll = next_poll.is_none();
+            if nopoll {
+                let wp = interface.sockets.queue.poll();
                 pin_mut!(se);
                 pin_mut!(wp);
                 match futures::future::select(se, wp).await {
@@ -153,76 +143,68 @@ impl Interface {
                         continue;
                     }
                 }
-            };
-            timestamp = clock.timestamp();
-            match s {
-                Selected::A((n, w, mut b)) => {
-                    let n = n?;
-                    info!("Written {} bytes", n);
-                    b.clear();
-                    writing = Some((w, b));
-                }
-                Selected::B((n, r, read_buf)) => {
-                    let n = n?;
-                    info!("ingress  packet size: {}", n);
-                    match Self::process(
-                        &capabilities.checksum,
-                        sockets,
-                        &read_buf[..n],
-                        timestamp,
-                        queue,
-                    )
-                    .await
-                    {
-                        Ok(reply) => {
-                            if let Some(repr) = reply {
-                                debug!("ingress reply: {:?}", repr);
-                                let packet = Packet::Tcp(repr);
-                                ingress_replies.push(packet);
-                            }
-                        }
-                        Err(e) => {
-                            if e != smoltcp::Error::Dropped {
-                                warn!("process error {:?}", e);
-                            }
+            } else {
+                se.await
+            }
+        };
+        match s {
+            Selected::A((n, w, mut b)) => {
+                let n = n?;
+                info!("Written {} bytes", n);
+                b.clear();
+                writing = Some((w, b));
+            }
+            Selected::B((n, r, read_buf)) => {
+                let n = n?;
+                info!("ingress  packet size: {}", n);
+                match interface.process(&read_buf[..n]).await {
+                    Ok(reply) => {
+                        if let Some(repr) = reply {
+                            debug!("ingress reply: {:?}", repr);
+                            let packet = Packet::Tcp(repr);
+                            ingress_replies.push(packet);
                         }
                     }
-                    selector.insert_b(read_future(r, read_buf));
+                    Err(e) => {
+                        if e != smoltcp::Error::Dropped {
+                            warn!("process error {:?}", e);
+                        }
+                    }
                 }
-                Selected::C((s, c, r)) => {
-                    info!("Closing {:?}'s {:?}", s, c);
-                    sockets.drop_tcp_half(&s, c, queue).await;
-                    selector.insert_c(recv_close(r));
-                }
-                Selected::D((s, t, p)) => {
-                    queue.send(s, t);
-                    selector.insert_d(recv_poll(p));
-                }
+                selector.insert_b(read_future(r, read_buf));
             }
-            tokio::task::yield_now().await;
+            Selected::C((s, c, r)) => {
+                info!("Closing {:?}'s {:?}", s, c);
+                interface.sockets.drop_tcp_half(&s, c).await;
+                selector.insert_c(recv_close(r));
+            }
+            Selected::D((s, t, p)) => {
+                interface.sockets.queue.send(s, t);
+                selector.insert_d(recv_poll(p));
+            }
         }
+        tokio::task::yield_now().await;
+    }
+}
+impl Interface {
+    pub(crate) async fn dispatch(&mut self, write_buf: &mut Vec<u8>, addr: AddrPair) {
+        self.sockets.dispatch(write_buf, addr).await;
     }
     /// Process incoming packet.
     pub(crate) async fn process<T: AsRef<[u8]> + ?Sized>(
-        checksum_caps: &ChecksumCapabilities,
-        sockets: &mut SocketPool,
+        &mut self,
         packet: &T,
-        timestamp: Instant,
-        queue: &mut DispatchQueue,
     ) -> Result<ProcessingReply, smoltcp::Error> {
-        Self::process_ipv4(checksum_caps, sockets, packet, timestamp, queue).await
+        self.process_ipv4(packet).await
     }
 
     /// Process incoming ipv4 packet.
     async fn process_ipv4<T: AsRef<[u8]> + ?Sized>(
-        checksum_caps: &ChecksumCapabilities,
-        sockets: &mut SocketPool,
+        &mut self,
         payload: &T,
-        timestamp: Instant,
-        queue: &mut DispatchQueue,
     ) -> SMResult<ProcessingReply> {
         let ipv4_packet = Ipv4Packet::new_checked(payload)?;
-        let ipv4_repr = Ipv4Repr::parse(&ipv4_packet, &checksum_caps)?;
+        let ipv4_repr = Ipv4Repr::parse(&ipv4_packet, &self.checksum_caps)?;
 
         if !ipv4_repr.src_addr.is_unicast() {
             // Discard packets with non-unicast source addresses.
@@ -236,17 +218,7 @@ impl Interface {
         trace!("processing ip4 to {:?}", ipv4_repr.dst_addr);
 
         match ipv4_repr.protocol {
-            IpProtocol::Tcp => {
-                Self::process_tcp(
-                    checksum_caps,
-                    sockets,
-                    timestamp,
-                    ip_repr,
-                    ip_payload,
-                    queue,
-                )
-                .await
-            }
+            IpProtocol::Tcp => self.process_tcp(ip_repr, ip_payload).await,
             _ => {
                 debug!("ipv4 not tcp");
                 Ok(None)
@@ -256,18 +228,15 @@ impl Interface {
 
     /// Process incoming tcp packet.
     async fn process_tcp(
-        checksum_caps: &ChecksumCapabilities,
-        sockets: &mut SocketPool,
-        timestamp: Instant,
+        &mut self,
         ip_repr: IpRepr,
         ip_payload: &[u8],
-        queue: &mut DispatchQueue,
     ) -> Result<Option<(IpRepr, TcpRepr<'static>)>, smoltcp::Error> {
         trace!("processing tcp to {:?}", ip_repr);
         let tcp_packet = TcpPacket::new_checked(ip_payload)?;
         let (src_addr, dst_addr) = (ip_repr.src_addr(), ip_repr.dst_addr());
-        let tcp_repr = TcpRepr::parse(&tcp_packet, &src_addr, &dst_addr, checksum_caps)?;
-        let reply = sockets.process(ip_repr, tcp_repr, timestamp, queue).await?;
+        let tcp_repr = TcpRepr::parse(&tcp_packet, &src_addr, &dst_addr, &self.checksum_caps)?;
+        let reply = self.sockets.process(ip_repr, tcp_repr).await?;
         Ok(reply)
     }
 }

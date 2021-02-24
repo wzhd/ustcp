@@ -4,7 +4,7 @@ use crate::stream::TcpStream;
 use crate::time::Clock;
 use smoltcp::iface::IpPacket as Packet;
 use smoltcp::phy::{ChecksumCapabilities, DeviceCapabilities};
-use smoltcp::wire::IpProtocol;
+use smoltcp::wire::{IpProtocol, Ipv6Packet, Ipv6Repr};
 use smoltcp::wire::{IpRepr, Ipv4Packet, Ipv4Repr, TcpPacket, TcpRepr};
 use smoltcp::Error;
 use std::io;
@@ -157,17 +157,19 @@ async fn io_loop(
             Selected::B((n, r, read_buf)) => {
                 let n = n?;
                 info!("ingress  packet size: {}", n);
-                match interface.process(&read_buf[..n]).await {
-                    Ok(reply) => {
-                        if let Some(repr) = reply {
-                            debug!("ingress reply: {:?}", repr);
-                            let packet = Packet::Tcp(repr);
-                            ingress_replies.push(packet);
+                if n > 0 {
+                    match interface.process(&read_buf[..n]).await {
+                        Ok(reply) => {
+                            if let Some(repr) = reply {
+                                debug!("ingress reply: {:?}", repr);
+                                let packet = Packet::Tcp(repr);
+                                ingress_replies.push(packet);
+                            }
                         }
-                    }
-                    Err(e) => {
-                        if e != smoltcp::Error::Dropped {
-                            warn!("process error {:?}", e);
+                        Err(e) => {
+                            if e != smoltcp::Error::Dropped {
+                                warn!("process error {:?}", e);
+                            }
                         }
                     }
                 }
@@ -195,14 +197,19 @@ impl Interface {
         &mut self,
         packet: &T,
     ) -> Result<ProcessingReply, smoltcp::Error> {
-        self.process_ipv4(packet).await
+        let packet = packet.as_ref();
+        let v = packet[0] / 16;
+        if v == 4 {
+            self.process_ipv4(packet).await
+        } else if v == 6 {
+            self.process_ipv6(packet).await
+        } else {
+            Err(smoltcp::Error::Dropped)
+        }
     }
 
     /// Process incoming ipv4 packet.
-    async fn process_ipv4<T: AsRef<[u8]> + ?Sized>(
-        &mut self,
-        payload: &T,
-    ) -> SMResult<ProcessingReply> {
+    async fn process_ipv4(&mut self, payload: &[u8]) -> SMResult<ProcessingReply> {
         let ipv4_packet = Ipv4Packet::new_checked(payload)?;
         let ipv4_repr = Ipv4Repr::parse(&ipv4_packet, &self.checksum_caps)?;
 
@@ -226,6 +233,29 @@ impl Interface {
         }
     }
 
+    async fn process_ipv6(&mut self, payload: &[u8]) -> SMResult<ProcessingReply> {
+        let ipv6_packet = Ipv6Packet::new_checked(payload)?;
+        let ipv6_repr = Ipv6Repr::parse(&ipv6_packet)?;
+
+        if !ipv6_repr.src_addr.is_unicast() {
+            // Discard packets with non-unicast source addresses.
+            debug!("non-unicast source address");
+            return Err(Error::Malformed);
+        }
+
+        let ip_repr = IpRepr::Ipv6(ipv6_repr);
+        let ip_payload = ipv6_packet.payload();
+
+        trace!("processing ip6 to {:?}", ipv6_repr.dst_addr);
+
+        match ipv6_repr.next_header {
+            IpProtocol::Tcp => self.process_tcp(ip_repr, ip_payload).await,
+            _ => {
+                debug!("ipv6 not tcp");
+                Ok(None)
+            }
+        }
+    }
     /// Process incoming tcp packet.
     async fn process_tcp(
         &mut self,

@@ -73,9 +73,3 @@ to instruct the operating systems to contact those addresses also via `tuna`.
 
     sudo ip route add 10.33.0.0/16 via 192.168.9.4 dev tuna
 
-# ustcp
-
-Uni-stream TCP. 
-A minimal fork of [smoltcp](https://crates.io/crates/smoltcp) that only aims to assemble a single `TcpStream` at a time.
-Actual IO operations on network interfaces, maintaining a collection of multiple sockets are all left to crates that build on ustcp.
-

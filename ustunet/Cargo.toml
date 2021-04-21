@@ -20,8 +20,7 @@ tracing-futures = "0.2.4"
 git = "https://github.com/wzhd/trilock.git"
 
 [dependencies.smoltcp]
-path = "../../smoltcp"
-default-features=true
+git = "https://github.com/wzhd/rstcp.git"
 
 [dependencies.tokio]
 version = "1"
